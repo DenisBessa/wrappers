@@ -143,6 +143,11 @@ mssql_fdw = [
     "num-traits",
     "thiserror",
 ]
+sybase_fdw = [
+    "odbc-api",
+    "lazy_static",
+    "thiserror",
+]
 redis_fdw = [
     "redis",
     "serde_json",
@@ -206,6 +211,7 @@ native_fdws = [
     "logflare_fdw",
     "auth0_fdw",
     "mssql_fdw",
+    "sybase_fdw",
     "redis_fdw",
     "cognito_fdw",
     "iceberg_fdw",
@@ -326,6 +332,10 @@ rust_decimal = { version = "1.37.1", optional = true }
 
 # for duckdb_fdw
 duckdb = { version = "=1.3.2", features = ["bundled"], optional = true }
+
+# for sybase_fdw
+odbc-api = { version = "8", optional = true }
+lazy_static = { version = "1.4", optional = true }
 
 [dev-dependencies]
 pgrx-tests = "=0.16.1"
