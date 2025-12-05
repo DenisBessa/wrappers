@@ -358,12 +358,26 @@ impl SybaseFdw {
         };
 
         // Sybase SQL Anywhere syntax
+        // IMPORTANT: We only push down LIMIT when there is also ORDER BY.
+        // This prevents issues with nested loop JOINs where PostgreSQL executes
+        // the foreign scan multiple times. Without ORDER BY, the LIMIT could
+        // cause incorrect results by returning only the first N rows on each
+        // iteration, missing rows that should match the JOIN conditions.
+        //
+        // When ORDER BY is present, it's likely an intentional user query
+        // rather than an optimizer-generated scan within a JOIN.
         let mut sql = if let Some(limit) = limit {
-            let real_limit = limit.offset + limit.count;
-            format!(
-                "SELECT TOP {} {} FROM {} AS _wrappers_tbl",
-                real_limit, tgts, &self.table
-            )
+            // Only push down LIMIT if we also have ORDER BY (similar to MSSQL FDW)
+            if !sorts.is_empty() {
+                let real_limit = limit.offset + limit.count;
+                format!(
+                    "SELECT TOP {} {} FROM {} AS _wrappers_tbl",
+                    real_limit, tgts, &self.table
+                )
+            } else {
+                // No ORDER BY means this might be a JOIN context - don't push down LIMIT
+                format!("SELECT {} FROM {} AS _wrappers_tbl", tgts, &self.table)
+            }
         } else {
             format!("SELECT {} FROM {} AS _wrappers_tbl", tgts, &self.table)
         };
@@ -484,6 +498,32 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
             scan_result: Vec::new(),
             iter_idx: 0,
         })
+    }
+
+    fn get_rel_size(
+        &mut self,
+        _quals: &[Qual],
+        columns: &[Column],
+        _sorts: &[Sort],
+        _limit: &Option<Limit>,
+        options: &HashMap<String, String>,
+    ) -> SybaseFdwResult<(i64, i32)> {
+        // Read the 'rows' option from the foreign table definition
+        // This allows users to provide row count estimates for better query planning
+        // Usage: CREATE FOREIGN TABLE ... OPTIONS (table 'foo', rows '10000');
+        let rows = options
+            .get("rows")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(1000); // Default estimate if not specified
+
+        // Estimate row width based on columns (rough estimate: 50 bytes per column)
+        let width = if columns.is_empty() {
+            100 // Default width
+        } else {
+            (columns.len() * 50) as i32
+        };
+
+        Ok((rows, width))
     }
 
     fn begin_scan(
