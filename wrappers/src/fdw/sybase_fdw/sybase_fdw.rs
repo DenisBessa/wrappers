@@ -151,6 +151,14 @@ pub(crate) struct SybaseFdw {
     tgt_cols: Vec<Column>,
     scan_result: Vec<FetchedRow>,
     iter_idx: usize,
+    
+    // Lazy execution support for parameterized queries
+    // When quals contain parameters (from JOINs), we defer query execution
+    // until iter_scan, when the parameter values have been evaluated.
+    query_executed: bool,
+    stored_quals: Vec<Qual>,
+    stored_sorts: Vec<Sort>,
+    stored_limit: Option<Limit>,
 }
 
 impl SybaseFdw {
@@ -461,6 +469,32 @@ impl SybaseFdw {
 
         Ok(())
     }
+
+    /// Execute the query and update statistics (used for lazy execution)
+    fn do_execute_query_with_stats(
+        &mut self,
+        quals: &[Qual],
+        sorts: &[Sort],
+        limit: &Option<Limit>,
+    ) -> SybaseFdwResult<()> {
+        let tgt_cols = self.tgt_cols.clone();
+        let sql = self.deparse(quals, &tgt_cols, sorts, limit)?;
+        self.execute_query(&sql)?;
+        self.query_executed = true;
+
+        stats::inc_stats(
+            Self::FDW_NAME,
+            stats::Metric::RowsIn,
+            self.scan_result.len() as i64,
+        );
+        stats::inc_stats(
+            Self::FDW_NAME,
+            stats::Metric::RowsOut,
+            self.scan_result.len() as i64,
+        );
+
+        Ok(())
+    }
 }
 
 impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
@@ -497,6 +531,11 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
             tgt_cols: Vec::new(),
             scan_result: Vec::new(),
             iter_idx: 0,
+            // Lazy execution fields
+            query_executed: false,
+            stored_quals: Vec::new(),
+            stored_sorts: Vec::new(),
+            stored_limit: None,
         })
     }
 
@@ -538,26 +577,41 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
         self.tgt_cols = columns.to_vec();
         self.iter_idx = 0;
         self.scan_result.clear();
+        self.query_executed = false;
 
-        // Build and execute query
-        let sql = self.deparse(quals, columns, sorts, limit)?;
-        self.execute_query(&sql)?;
+        // Store query parameters for potential lazy execution
+        self.stored_quals = quals.to_vec();
+        self.stored_sorts = sorts.to_vec();
+        self.stored_limit = limit.clone();
 
-        stats::inc_stats(
-            Self::FDW_NAME,
-            stats::Metric::RowsIn,
-            self.scan_result.len() as i64,
-        );
-        stats::inc_stats(
-            Self::FDW_NAME,
-            stats::Metric::RowsOut,
-            self.scan_result.len() as i64,
-        );
+        // Check if any quals have unevaluated parameters
+        // Parameters come from JOINs with local tables (e.g., WHERE col IN (SELECT ...))
+        // When there are parameters, their values are not available until iter_scan
+        let has_params = quals.iter().any(|q| q.param.is_some());
 
-        Ok(())
+        if has_params {
+            // Defer query execution to iter_scan when parameters will be evaluated
+            // This enables "lazy execution" for parameterized queries
+            Ok(())
+        } else {
+            // No parameters - execute query immediately (normal path)
+            self.do_execute_query_with_stats(quals, sorts, limit)
+        }
     }
 
     fn iter_scan(&mut self, row: &mut Row) -> SybaseFdwResult<Option<()>> {
+        // Lazy execution: if query hasn't been executed yet, do it now
+        // At this point, parameter values from JOINs have been evaluated
+        // and are available in the qual's value field
+        if !self.query_executed {
+            // Clone stored values to avoid borrow issues
+            let quals = self.stored_quals.clone();
+            let sorts = self.stored_sorts.clone();
+            let limit = self.stored_limit.clone();
+            
+            self.do_execute_query_with_stats(&quals, &sorts, &limit)?;
+        }
+
         if self.iter_idx >= self.scan_result.len() {
             return Ok(None);
         }
@@ -578,7 +632,19 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
     }
 
     fn re_scan(&mut self) -> SybaseFdwResult<()> {
+        // Reset for potential re-execution with new parameter values
+        // This is called by PostgreSQL when it needs to re-scan the foreign table
+        // (e.g., in nested loop joins where outer values change)
         self.iter_idx = 0;
+        
+        // If we have stored quals with parameters, we need to re-execute
+        // the query on the next iter_scan with the new parameter values
+        let has_params = self.stored_quals.iter().any(|q| q.param.is_some());
+        if has_params {
+            self.scan_result.clear();
+            self.query_executed = false;
+        }
+        
         Ok(())
     }
 
