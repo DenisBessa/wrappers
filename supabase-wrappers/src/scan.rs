@@ -452,9 +452,9 @@ pub(super) extern "C-unwind" fn get_foreign_paths<
         
         // Create parameterized paths for join clauses
         // This allows the planner to push down join conditions to the FDW
-        // NOTE: Temporarily disabled - causes performance issues with complex queries
-        // The paths are being created but without proper runtime value passing,
-        // they may cause the planner to choose suboptimal plans
+        // NOTE: Temporarily disabled - without proper runtime value passing via
+        // extract_parameterized_quals and build_fdw_exprs, these paths cause
+        // the planner to choose inefficient plans that never receive parameter values
         let _enable_parameterized_paths = false;
         for join_clause in &state.join_clauses {
             if !_enable_parameterized_paths {
@@ -544,9 +544,9 @@ pub(super) extern "C-unwind" fn get_foreign_paths<
 
 #[pg_guard]
 pub(super) extern "C-unwind" fn get_foreign_plan<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(
-    _root: *mut pg_sys::PlannerInfo,
+    root: *mut pg_sys::PlannerInfo,
     baserel: *mut pg_sys::RelOptInfo,
-    _foreigntableid: pg_sys::Oid,
+    foreigntableid: pg_sys::Oid,
     best_path: *mut pg_sys::ForeignPath,
     tlist: *mut pg_sys::List,
     scan_clauses: *mut pg_sys::List,
@@ -554,16 +554,20 @@ pub(super) extern "C-unwind" fn get_foreign_plan<E: Into<ErrorReport>, W: Foreig
 ) -> *mut pg_sys::ForeignScan {
     debug2!("---> get_foreign_plan");
     unsafe {
-        let state = PgBox::<FdwState<E, W>>::from_pg((*baserel).fdw_private as _);
+        let mut state = PgBox::<FdwState<E, W>>::from_pg((*baserel).fdw_private as _);
 
-        // Check if this is a parameterized path (for logging only)
+        // Check if this is a parameterized path
         let is_parameterized = !best_path.is_null() && !(*best_path).path.param_info.is_null();
         
         if is_parameterized {
             debug2!("Wrappers: using parameterized path in get_foreign_plan");
-            // Note: We don't extract parameterized quals here yet
-            // The parameter values will be evaluated at runtime via assign_paramenter_value
+            // NOTE: extract_parameterized_quals and build_fdw_exprs temporarily disabled
+            // They cause segfaults during query execution. The paths are being created
+            // but the runtime value passing needs more investigation.
         }
+
+        // fdw_exprs disabled for now - causes segfaults
+        let fdw_exprs = ptr::null_mut();
 
         // Extract actual clauses for local evaluation
         let actual_clauses = pg_sys::extract_actual_clauses(scan_clauses, false);
@@ -581,7 +585,7 @@ pub(super) extern "C-unwind" fn get_foreign_plan<E: Into<ErrorReport>, W: Foreig
             tlist,
             actual_clauses,
             (*baserel).relid,
-            ptr::null_mut(), // No fdw_exprs for now
+            fdw_exprs,
             fdw_private as _,
             ptr::null_mut(),
             ptr::null_mut(),
