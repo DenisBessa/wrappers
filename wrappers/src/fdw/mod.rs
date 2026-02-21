@@ -45,3 +45,6 @@ mod iceberg_fdw;
 
 #[cfg(feature = "duckdb_fdw")]
 mod duckdb_fdw;
+
+#[cfg(feature = "sybase_fdw")]
+mod sybase_fdw;
