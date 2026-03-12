@@ -21,7 +21,6 @@ use std::ptr;
 use std::sync::OnceLock;
 
 use super::sybase_fdw::value_to_cell;
-use crate::stats;
 use supabase_wrappers::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -838,8 +837,6 @@ fn execute_join_query(state: &mut JoinScanState) {
         }
     }
 
-    stats::inc_stats("SybaseFdw", stats::Metric::RowsIn, state.rows.len() as i64);
-    stats::inc_stats("SybaseFdw", stats::Metric::RowsOut, state.rows.len() as i64);
 }
 
 // ---------------------------------------------------------------------------

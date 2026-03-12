@@ -819,6 +819,121 @@ mod tests {
     }
 
     // ========================================================================
+    // Query 5: COUNT DISTINCT customers across fovcheque + geempre + local.
+    // Tests JOIN between large VIEW (fovcheque), geempre, and local table
+    // with date range filter and aggregation.
+    // ========================================================================
+
+    /// Test COUNT(DISTINCT) query joining fovcheque (VIEW) with geempre and local table.
+    /// This query was taking 75+ seconds in production.
+    /// The date range on competencia should be pushed down to Sybase.
+    #[pg_test]
+    fn sybase_fovcheque_count_distinct() {
+        Spi::connect_mut(|c| {
+            setup_server(c);
+            create_fovcheque(c);
+            create_geempre(c);
+            create_local_customers(c);
+
+            let results = c
+                .select(
+                    "SELECT
+                        COUNT(DISTINCT ct.customer_id) AS count
+                     FROM test_fovcheque vc
+                     JOIN test_geempre ge ON ge.codi_emp = vc.codi_emp
+                     JOIN test_local_customers ct ON ct.tax_number = ge.cgce_emp
+                     WHERE ct.type = 'cnpj'
+                       AND vc.competencia BETWEEN '2025-01-01' AND '2025-12-31'
+                     LIMIT 1",
+                    None,
+                    &[],
+                )
+                .unwrap();
+
+            assert_eq!(results.len(), 1, "should return exactly 1 count row");
+        });
+    }
+
+    // ========================================================================
+    // Query 6: Payroll events with multiple correlated subqueries to
+    // foeventosbases (checking FGTS, INSS, INSS employee, IRRF bases).
+    // ========================================================================
+
+    /// Test payroll events query with multiple COALESCE/subquery columns.
+    /// Each subquery checks foeventosbases for different base types.
+    /// This pattern is common in payroll reporting and was slow in production.
+    #[pg_test]
+    fn sybase_payroll_events_full() {
+        Spi::connect_mut(|c| {
+            setup_server(c);
+            create_fomovto(c);
+            create_geempre(c);
+            create_foeventos(c);
+            create_foeventosbases(c);
+            create_local_customers(c);
+
+            let results = c
+                .select(
+                    "SELECT
+                        ev.nome,
+                        COALESCE((
+                            SELECT true
+                            FROM test_foeventosbases eb
+                            WHERE eb.codi_emp = m.codi_emp
+                              AND eb.i_cadbases IN (1, 2, 3, 4)
+                              AND eb.i_eventos = m.i_eventos
+                            LIMIT 1
+                        ), false) AS is_base_fgts,
+                        COALESCE((
+                            SELECT true
+                            FROM test_foeventosbases eb
+                            WHERE eb.codi_emp = m.codi_emp
+                              AND eb.i_cadbases IN (5, 6, 7, 8, 9, 10)
+                              AND eb.i_eventos = m.i_eventos
+                            LIMIT 1
+                        ), false) AS is_base_inss,
+                        COALESCE((
+                            SELECT true
+                            FROM test_foeventosbases eb
+                            WHERE eb.codi_emp = m.codi_emp
+                              AND eb.i_cadbases IN (11, 12, 13, 14)
+                              AND eb.i_eventos = m.i_eventos
+                            LIMIT 1
+                        ), false) AS is_base_inss_employee,
+                        COALESCE((
+                            SELECT true
+                            FROM test_foeventosbases eb
+                            WHERE eb.codi_emp = m.codi_emp
+                              AND eb.i_cadbases IN (15, 16, 17, 18, 19, 20)
+                              AND eb.i_eventos = m.i_eventos
+                            LIMIT 1
+                        ), false) AS is_base_irrf,
+                        SUM(m.valor_cal) AS total
+                     FROM test_fomovto m
+                     JOIN test_geempre ge ON ge.codi_emp = m.codi_emp
+                     JOIN test_local_customers ct ON ct.tax_number = ge.cgce_emp
+                     JOIN test_foeventos ev ON m.i_eventos = ev.i_eventos
+                       AND m.codi_emp = ev.codi_emp
+                     WHERE ct.customer_id = 'cust-test-001'
+                       AND ct.type = 'cnpj'
+                       AND m.data BETWEEN '2025-01-01' AND '2025-01-31'
+                     GROUP BY ev.nome, is_base_fgts, is_base_inss,
+                              is_base_inss_employee, is_base_irrf
+                     ORDER BY ev.nome ASC
+                     LIMIT 10",
+                    None,
+                    &[],
+                )
+                .unwrap();
+
+            assert!(
+                results.len() <= 10,
+                "should return at most 10 payroll event rows"
+            );
+        });
+    }
+
+    // ========================================================================
     // Production employee listing query (7 foreign tables + local)
     // ========================================================================
 

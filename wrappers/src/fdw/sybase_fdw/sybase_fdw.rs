@@ -1,4 +1,3 @@
-use crate::stats;
 use odbc_api::{
     Connection, ConnectionOptions, Cursor, Environment, ResultSetMetadata, buffers::TextRowSet,
 };
@@ -496,17 +495,6 @@ impl SybaseFdw {
         self.execute_query(&sql)?;
         self.query_executed = true;
 
-        stats::inc_stats(
-            Self::FDW_NAME,
-            stats::Metric::RowsIn,
-            self.scan_result.len() as i64,
-        );
-        stats::inc_stats(
-            Self::FDW_NAME,
-            stats::Metric::RowsOut,
-            self.scan_result.len() as i64,
-        );
-
         Ok(())
     }
 }
@@ -548,8 +536,6 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
                 "DRIVER={{FreeTDS}};SERVER={host};PORT={port};DATABASE={database};UID={user};PWD={password};TDS_Version=5.0"
             )
         };
-
-        stats::inc_stats(Self::FDW_NAME, stats::Metric::CreateTimes, 1);
 
         Ok(SybaseFdw {
             conn_str,
