@@ -630,15 +630,15 @@ impl ForeignDataWrapper<MysqlFdwError> for MysqlFdw {
         let mut table_cols: TableColInfo = HashMap::new();
 
         for row in &rows {
-            let table_name: String = row.get("TABLE_NAME").unwrap_or_default();
-            let column_name: String = row.get("COLUMN_NAME").unwrap_or_default();
-            let data_type: String = row.get("DATA_TYPE").unwrap_or_default();
-            let column_type: String = row.get("COLUMN_TYPE").unwrap_or_default();
-            let is_nullable: String = row.get("IS_NULLABLE").unwrap_or_default();
+            let table_name: String = row.get("table_name").unwrap_or_default();
+            let column_name: String = row.get("column_name").unwrap_or_default();
+            let data_type: String = row.get("data_type").unwrap_or_default();
+            let column_type: String = row.get("column_type").unwrap_or_default();
+            let is_nullable: String = row.get("is_nullable").unwrap_or_default();
             let numeric_precision: Option<u64> =
-                row.get::<Option<u64>, _>("NUMERIC_PRECISION").flatten();
-            let numeric_scale: Option<u64> = row.get::<Option<u64>, _>("NUMERIC_SCALE").flatten();
-            let column_key: String = row.get("COLUMN_KEY").unwrap_or_default();
+                row.get::<Option<u64>, _>("numeric_precision").flatten();
+            let numeric_scale: Option<u64> = row.get::<Option<u64>, _>("numeric_scale").flatten();
+            let column_key: String = row.get("column_key").unwrap_or_default();
 
             if !table_cols.contains_key(&table_name) {
                 table_names.push(table_name.clone());
