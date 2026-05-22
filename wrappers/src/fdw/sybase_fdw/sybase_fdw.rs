@@ -147,7 +147,7 @@ fn parse_timestamp(value: &str) -> Option<pgrx::prelude::Timestamp> {
     .ok()
 }
 
-struct SybaseCellFormatter {}
+pub(super) struct SybaseCellFormatter {}
 
 impl CellFormatter for SybaseCellFormatter {
     fn fmt_cell(&mut self, cell: &Cell) -> String {
@@ -156,6 +156,56 @@ impl CellFormatter for SybaseCellFormatter {
             _ => format!("{cell}"),
         }
     }
+}
+
+/// Render a single qual to Sybase SQL.
+///
+/// For `IN (...)` / `= ANY (ARRAY[...])`, Postgres delivers a single qual with
+/// `use_or=true`, `operator="="`, and `value=Value::Array([...])`. The framework's
+/// `deparse_with_fmt` would render this as `f = v1 or f = v2 or ...` — and once
+/// joined with other quals via ` AND `, SQL precedence (AND binds tighter than
+/// OR) silently rewrites the WHERE clause. For example:
+///
+/// ```sql
+/// WHERE codi_emp = 51800 AND codi_sai = 100 OR codi_sai = 200
+/// -- parses as: (codi_emp = 51800 AND codi_sai = 100) OR codi_sai = 200
+/// -- → returns every row with codi_sai = 200, ignoring codi_emp
+/// ```
+///
+/// We emit `field IN (...)` instead, which has unambiguous precedence and lets
+/// the remote optimizer use an index scan. For non-`=` operators with an array
+/// (rare in practice) we still parenthesise the OR list.
+pub(super) fn deparse_qual_to_sybase(qual: &Qual, fmt: &mut SybaseCellFormatter) -> String {
+    let oper = qual.operator.as_str();
+
+    if let Value::Cell(cell) = &qual.value
+        && let Cell::Bool(_) = cell
+    {
+        if oper == "is" {
+            return format!("{} = {}", qual.field, fmt.fmt_cell(cell));
+        } else if oper == "is not" {
+            return format!("{} <> {}", qual.field, fmt.fmt_cell(cell));
+        }
+    }
+
+    if qual.use_or
+        && let Value::Array(cells) = &qual.value
+    {
+        let values: Vec<String> = cells.iter().map(|c| fmt.fmt_cell(c)).collect();
+        return match oper {
+            "=" => format!("{} IN ({})", qual.field, values.join(", ")),
+            "<>" => format!("{} NOT IN ({})", qual.field, values.join(", ")),
+            _ => {
+                let conds: Vec<String> = cells
+                    .iter()
+                    .map(|c| format!("{} {} {}", qual.field, oper, fmt.fmt_cell(c)))
+                    .collect();
+                format!("({})", conds.join(" OR "))
+            }
+        };
+    }
+
+    qual.deparse_with_fmt(fmt)
 }
 
 // Store fetched rows
@@ -392,22 +442,10 @@ impl SybaseFdw {
         };
 
         if !quals.is_empty() {
+            let mut fmt = SybaseCellFormatter {};
             let cond = quals
                 .iter()
-                .map(|q| {
-                    let oper = q.operator.as_str();
-                    let mut fmt = SybaseCellFormatter {};
-                    if let Value::Cell(cell) = &q.value
-                        && let Cell::Bool(_) = cell
-                    {
-                        if oper == "is" {
-                            return format!("{} = {}", q.field, fmt.fmt_cell(cell));
-                        } else if oper == "is not" {
-                            return format!("{} <> {}", q.field, fmt.fmt_cell(cell));
-                        }
-                    }
-                    q.deparse_with_fmt(&mut fmt)
-                })
+                .map(|q| deparse_qual_to_sybase(q, &mut fmt))
                 .collect::<Vec<String>>()
                 .join(" AND ");
 

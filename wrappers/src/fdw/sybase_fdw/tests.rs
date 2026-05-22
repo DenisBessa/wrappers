@@ -1,5 +1,109 @@
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
+mod deparse_qual_unit_tests {
+    use super::super::sybase_fdw::{SybaseCellFormatter, deparse_qual_to_sybase};
+    use supabase_wrappers::prelude::{Cell, Qual, Value};
+
+    fn qual(field: &str, operator: &str, value: Value, use_or: bool) -> Qual {
+        Qual {
+            field: field.to_string(),
+            operator: operator.to_string(),
+            value,
+            use_or,
+            param: None,
+        }
+    }
+
+    // IN (...) — the bug fix
+    #[pgrx::pg_test]
+    fn renders_in_for_integer_array() {
+        let mut fmt = SybaseCellFormatter {};
+        let q = qual(
+            "codi_sai",
+            "=",
+            Value::Array(vec![Cell::I32(164858), Cell::I32(164907)]),
+            true,
+        );
+        assert_eq!(
+            deparse_qual_to_sybase(&q, &mut fmt),
+            "codi_sai IN (164858, 164907)"
+        );
+    }
+
+    #[pgrx::pg_test]
+    fn renders_in_for_single_value_array() {
+        let mut fmt = SybaseCellFormatter {};
+        let q = qual("id", "=", Value::Array(vec![Cell::I64(42)]), true);
+        assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "id IN (42)");
+    }
+
+    #[pgrx::pg_test]
+    fn renders_in_for_string_array() {
+        let mut fmt = SybaseCellFormatter {};
+        let q = qual(
+            "tipo",
+            "=",
+            Value::Array(vec![
+                Cell::String("A".to_string()),
+                Cell::String("B".to_string()),
+            ]),
+            true,
+        );
+        assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "tipo IN ('A', 'B')");
+    }
+
+    // NOT IN (Postgres rewrites `NOT IN` as `<> ALL`; useOr=false → no array path,
+    // but defensive coverage in case the planner emits `<>` with useOr=true).
+    #[pgrx::pg_test]
+    fn renders_not_in_for_integer_array_with_or() {
+        let mut fmt = SybaseCellFormatter {};
+        let q = qual(
+            "status",
+            "<>",
+            Value::Array(vec![Cell::I32(1), Cell::I32(2)]),
+            true,
+        );
+        assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "status NOT IN (1, 2)");
+    }
+
+    // Non-`=`/`<>` array operators (e.g. `>`) — keep parenthesised OR list.
+    #[pgrx::pg_test]
+    fn renders_parenthesised_or_for_other_operators() {
+        let mut fmt = SybaseCellFormatter {};
+        let q = qual(
+            "v",
+            ">",
+            Value::Array(vec![Cell::I32(10), Cell::I32(20)]),
+            true,
+        );
+        assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "(v > 10 OR v > 20)");
+    }
+
+    // Scalar fall-through: delegates to framework deparse, no precedence risk.
+    #[pgrx::pg_test]
+    fn renders_scalar_equality() {
+        let mut fmt = SybaseCellFormatter {};
+        let q = qual("codi_emp", "=", Value::Cell(Cell::I32(51800)), false);
+        assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "codi_emp = 51800");
+    }
+
+    #[pgrx::pg_test]
+    fn renders_boolean_is_null_replacement() {
+        let mut fmt = SybaseCellFormatter {};
+        let q = qual("active", "is", Value::Cell(Cell::Bool(true)), false);
+        assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "active = 1");
+    }
+
+    #[pgrx::pg_test]
+    fn renders_boolean_is_not() {
+        let mut fmt = SybaseCellFormatter {};
+        let q = qual("active", "is not", Value::Cell(Cell::Bool(false)), false);
+        assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "active <> 0");
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
 mod tests {
     use pgrx::prelude::*;
 
