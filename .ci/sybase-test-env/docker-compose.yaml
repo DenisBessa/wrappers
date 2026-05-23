@@ -1,0 +1,62 @@
+name: sybase-fdw-test
+
+services:
+  sybase:
+    image: brenoandrader/sqlanywhere17:latest
+    platform: linux/amd64
+    container_name: sybase-fdw-test-sybase
+    entrypoint:
+      - sh
+      - -c
+      - "dbsrv17 -n bethadba -x 'tcpip(port=2638)' -tl 0 /db/bethadba.db"
+    volumes:
+      - sybase-db:/db
+    ports:
+      - "12638:2638"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "dbisql -nogui -c 'UID=externo;PWD=externo123;HOST=localhost:2638;DBN=bethadba;ENG=bethadba' 'SELECT 1' >/dev/null 2>&1"
+      interval: 5s
+      retries: 30
+      start_period: 30s
+      timeout: 5s
+
+  postgres:
+    build:
+      context: ./fdw
+      dockerfile: Dockerfile
+    image: sybase-fdw-test-postgres:dev
+    container_name: sybase-fdw-test-postgres
+    platform: linux/amd64
+    depends_on:
+      sybase:
+        condition: service_healthy
+    volumes:
+      # O código fonte do repo é montado em /workspace/wrappers para que
+      # build-fdw.sh consiga rebuildar após edits sem reconstruir a imagem.
+      - ../..:/workspace/wrappers
+      - pg-data:/var/lib/postgresql/17/main
+      - pg-cargo-target:/workspace/wrappers/target
+      - pg-cores:/workspace/cores
+    ports:
+      - "15432:5432"
+    privileged: true
+    cap_add:
+      - SYS_PTRACE
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "pg_isready -h localhost -U postgres"
+      interval: 5s
+      retries: 60
+      start_period: 60s
+      timeout: 5s
+
+volumes:
+  sybase-db:
+    external: true
+    name: sybase-test-db
+  pg-data:
+  pg-cargo-target:
+  pg-cores:

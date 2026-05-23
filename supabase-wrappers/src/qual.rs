@@ -221,17 +221,26 @@ pub(crate) unsafe fn extract_from_op_expr(
                             // add a dummy value if this is query parameter, the actual value
                             // will be extracted from execution state
                             let right = right as *mut pg_sys::Param;
+                            // Deep-copy the Param node into the current memcontext
+                            // (state.tmp_ctx) so it outlives the planner's per-statement
+                            // MessageContext. Without this, prepared statements that
+                            // get cached as generic plans see param.expr_eval.expr
+                            // dangling on the 2nd+ EXECUTE, leading to
+                            // `unrecognized node type: 0` when ExecInitExpr walks it.
+                            let expr: *mut pg_sys::Expr =
+                                if (*right).paramkind == pg_sys::ParamKind::PARAM_EXEC {
+                                    pg_sys::copyObjectImpl(right as *const std::ffi::c_void)
+                                        as *mut pg_sys::Expr
+                                } else {
+                                    ptr::null_mut()
+                                };
                             let param = Param {
                                 kind: (*right).paramkind,
                                 id: (*right).paramid as _,
                                 type_oid: (*right).paramtype,
                                 eval_value: Mutex::new(None).into(),
                                 expr_eval: ExprEval {
-                                    expr: if (*right).paramkind == pg_sys::ParamKind::PARAM_EXEC {
-                                        right as _
-                                    } else {
-                                        ptr::null_mut()
-                                    },
+                                    expr,
                                     expr_state: ptr::null_mut(),
                                 },
                             };
@@ -245,14 +254,19 @@ pub(crate) unsafe fn extract_from_op_expr(
                             // Handle evaluable expressions without variable references
                             // (e.g., NOW(), CURRENT_DATE, arithmetic on constants).
                             // These will be evaluated at execution time via PARAM_EXEC path.
+                            // Deep-copy the expression so its lifetime matches state.tmp_ctx
+                            // (see Param T_Param branch above for rationale).
                             let type_oid = pg_sys::exprType(right as *mut pg_sys::Node);
+                            let expr_copy = pg_sys::copyObjectImpl(
+                                right as *const std::ffi::c_void,
+                            ) as *mut pg_sys::Expr;
                             let param = Param {
                                 kind: pg_sys::ParamKind::PARAM_EXEC,
                                 id: 0,
                                 type_oid,
                                 eval_value: Mutex::new(None).into(),
                                 expr_eval: ExprEval {
-                                    expr: right as _,
+                                    expr: expr_copy,
                                     expr_state: ptr::null_mut(),
                                 },
                             };

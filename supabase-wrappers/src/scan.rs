@@ -57,6 +57,19 @@ pub(crate) struct FdwState<E: Into<ErrorReport>, W: ForeignDataWrapper<E>> {
     row: Row,
     // fingerprint of current parameter values to detect rescan changes
     param_fingerprint: String,
+
+    // When true, a MemoryContextCallback has been registered that will free
+    // this FdwState when the cached plan's memory context is reset (DEALLOCATE
+    // or session end). end_foreign_scan must NOT drop the state in that case —
+    // it would be a use-after-free on the next EXECUTE of a cached generic plan.
+    //
+    // See bug #2 (`unrecognized node type: 0` in production / SIGSEGV locally):
+    // with prepared statements, PG switches to a generic plan around the 6th
+    // EXECUTE and caches the ForeignScan node; fdw_private (a List with a Const
+    // wrapping the FdwState pointer) is preserved across executions. The first
+    // end_foreign_scan would drop the state, and the next BeginForeignScan
+    // would read a dangling pointer.
+    cleanup_registered: bool,
     _phantom: PhantomData<E>,
 }
 
@@ -76,6 +89,7 @@ impl<E: Into<ErrorReport>, W: ForeignDataWrapper<E>> FdwState<E, W> {
             nulls: Vec::new(),
             row: Row::new(),
             param_fingerprint: String::new(),
+            cleanup_registered: false,
             _phantom: PhantomData,
         }
     }
@@ -173,6 +187,62 @@ unsafe fn drop_fdw_state<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(
 ) {
     let boxed_fdw_state = unsafe { Box::from_raw(fdw_state) };
     drop(boxed_fdw_state);
+}
+
+/// MemoryContextCallback that drops FdwState<E,W>. PG calls this when the
+/// memory context where fdw_private lives is reset (DEALLOCATE / session
+/// end). The callback's `arg` is the FdwState pointer.
+///
+/// Monomorphized per (E, W) so the right Drop impl runs.
+#[pg_guard]
+unsafe extern "C-unwind" fn fdw_state_drop_callback<
+    E: Into<ErrorReport>,
+    W: ForeignDataWrapper<E>,
+>(
+    arg: *mut std::ffi::c_void,
+) {
+    let fdw_state = arg as *mut FdwState<E, W>;
+    if !fdw_state.is_null() {
+        unsafe { drop_fdw_state(fdw_state) };
+    }
+}
+
+/// Register a MemoryContextCallback on the memcontext where `host_ptr` is
+/// allocated. When that context is reset, the FdwState pointed to by
+/// `state_ptr` is dropped.
+///
+/// `host_ptr` should be the fdw_private List (or any pointer co-allocated
+/// with the cached plan). Calling `GetMemoryChunkContext` on it gives us
+/// the context whose lifetime tracks the plan.
+unsafe fn register_fdw_state_cleanup<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(
+    host_ptr: *mut std::ffi::c_void,
+    state_ptr: *mut FdwState<E, W>,
+) {
+    unsafe {
+        if host_ptr.is_null() || state_ptr.is_null() {
+            return;
+        }
+        let ctx = pg_sys::GetMemoryChunkContext(host_ptr);
+        if ctx.is_null() {
+            return;
+        }
+        // Allocate the callback struct in the same context we're watching so
+        // it goes away with the context. `MemoryContextAlloc` raises an ERROR
+        // on OOM instead of returning null, so no further null check is needed.
+        let cb = pg_sys::MemoryContextAlloc(
+            ctx,
+            std::mem::size_of::<pg_sys::MemoryContextCallback>(),
+        ) as *mut pg_sys::MemoryContextCallback;
+        std::ptr::write(
+            cb,
+            pg_sys::MemoryContextCallback {
+                func: Some(fdw_state_drop_callback::<E, W>),
+                arg: state_ptr as *mut std::ffi::c_void,
+                next: ptr::null_mut(),
+            },
+        );
+        pg_sys::MemoryContextRegisterResetCallback(ctx, cb);
+    }
 }
 
 #[pg_guard]
@@ -481,6 +551,7 @@ pub(super) extern "C-unwind" fn get_foreign_plan<E: Into<ErrorReport>, W: Foreig
         let mut fdw_expr_list: *mut pg_sys::List = ptr::null_mut();
 
         if is_parameterized {
+            let tmp_ctx = state.tmp_ctx;
             pgrx::memcx::current_context(|mcx| {
                 if let Some(clauses) =
                     pgrx::list::List::<*mut std::ffi::c_void>::downcast_ptr_in_memcx(
@@ -553,17 +624,26 @@ pub(super) extern "C-unwind" fn get_foreign_plan<E: Into<ErrorReport>, W: Foreig
                                 continue;
                             }
 
-                            // Local condition: try to extract as Qual (handles SubPlan PARAM_EXEC)
-                            if let Some(qual) = extract_from_op_expr(
-                                root,
-                                foreigntableid,
-                                (*baserel).relids,
-                                expr as _,
-                            ) {
-                                if qual.param.is_some() {
-                                    state.quals.push(qual);
-                                    continue;
-                                }
+                            // Local condition: try to extract as Qual (handles
+                            // SubPlan PARAM_EXEC). Switch to state.tmp_ctx so
+                            // that copyObject calls inside extract_from_op_expr
+                            // (deep-copying Param nodes) land in our session-
+                            // lived context rather than MessageContext, which
+                            // PG resets between EXECUTEs of a prepared statement.
+                            let qual = PgMemoryContexts::For(tmp_ctx)
+                                .switch_to(|_| {
+                                    extract_from_op_expr(
+                                        root,
+                                        foreigntableid,
+                                        (*baserel).relids,
+                                        expr as _,
+                                    )
+                                });
+                            if let Some(qual) = qual
+                                && qual.param.is_some()
+                            {
+                                state.quals.push(qual);
+                                continue;
                             }
                         }
                     }
@@ -834,35 +914,71 @@ pub(super) extern "C-unwind" fn begin_foreign_scan<
         let mut state = FdwState::<E, W>::deserialize_from_list((*plan).fdw_private as _);
         assert!(!state.is_null());
 
+        // First time we see this state: register the memcontext cleanup
+        // callback (so the state is dropped only when the cached plan is
+        // freed, not on every end_foreign_scan), and do work that must run
+        // exactly once over the plan's lifetime (qual extraction from
+        // fdw_exprs — see the SYBASE FORK block below).
+        let first_time = !state.cleanup_registered;
+        if first_time {
+            state.cleanup_registered = true;
+            register_fdw_state_cleanup::<E, W>(
+                (*plan).fdw_private as *mut std::ffi::c_void,
+                state.as_ptr(),
+            );
+        }
+
         // SYBASE FORK BEGIN: extract parameterized quals from fdw_exprs.
         // Counterpart of the fdw_exprs injection in get_foreign_plan.
         // Not present in upstream supabase/wrappers.
+        //
         // At plan time (get_foreign_plan), join conditions with outer Vars
         // were placed in fdw_exprs. PostgreSQL's replace_nestloop_params has
         // now converted those outer Vars to PARAM_EXEC nodes. We can extract
         // them as Quals with Param references for remote pushdown.
+        //
+        // CRITICAL: only extract on the first BeginScan (gated by
+        // cleanup_registered). The state now survives across multiple EXECUTEs
+        // of a cached generic plan, so re-extracting would append stale Qual
+        // entries whose `param.expr_eval.expr` points into prior-execution
+        // memcontexts that PG has already reset. On the next assign_parameter
+        // _value, ExecInitExpr would walk a freed Node and crash with
+        // "unrecognized node type: 0".
         let fdw_exprs = (*plan).fdw_exprs;
-        if !fdw_exprs.is_null() {
+        if !fdw_exprs.is_null() && first_time {
             let scanrelid = (*plan).scan.scanrelid;
             let rel = scan_state.ss_currentRelation;
             let foreigntableid = (*rel).rd_id;
             let baserel_ids = pg_sys::bms_make_singleton(scanrelid as c_int);
+            let tmp_ctx = state.tmp_ctx;
 
             pgrx::memcx::current_context(|mcx| {
                 if let Some(exprs) =
-                    pgrx::list::List::<*mut std::ffi::c_void>::downcast_ptr_in_memcx(fdw_exprs, mcx)
+                    pgrx::list::List::<*mut std::ffi::c_void>::downcast_ptr_in_memcx(
+                        fdw_exprs, mcx,
+                    )
                 {
                     for expr_ptr in exprs.iter() {
                         let expr = *expr_ptr as *mut pg_sys::Node;
-                        if pgrx::is_a(expr, pg_sys::NodeTag::T_OpExpr) {
-                            if let Some(qual) = extract_from_op_expr(
+                        if !pgrx::is_a(expr, pg_sys::NodeTag::T_OpExpr) {
+                            continue;
+                        }
+                        // Switch to state.tmp_ctx so the copyObject in
+                        // extract_from_op_expr lands in session-lived memory
+                        // (otherwise the per-execute context is reset between
+                        // EXECUTEs of a cached generic plan, leaving a
+                        // dangling pointer in param.expr_eval.expr that crashes
+                        // ExecInitExpr with "unrecognized node type: 0").
+                        let qual = PgMemoryContexts::For(tmp_ctx).switch_to(|_| {
+                            extract_from_op_expr(
                                 ptr::null_mut(), // root not needed
                                 foreigntableid,
                                 baserel_ids,
                                 expr as *mut pg_sys::OpExpr,
-                            ) {
-                                state.quals.push(qual);
-                            }
+                            )
+                        });
+                        if let Some(qual) = qual {
+                            state.quals.push(qual);
                         }
                     }
                 }
@@ -883,8 +999,9 @@ pub(super) extern "C-unwind" fn begin_foreign_scan<
                 state.begin_scan()
             };
             if result.is_err() {
-                drop_fdw_state(state.as_ptr());
-                (*plan).fdw_private = ptr::null::<FdwState<E, W>>() as _;
+                // Don't drop here — the memcontext callback owns the state
+                // lifetime now. Just propagate the error.
+                (*node).fdw_state = ptr::null::<FdwState<E, W>>() as _;
                 result.report_unwrap();
             }
 
@@ -931,7 +1048,7 @@ pub(super) extern "C-unwind" fn iterate_foreign_scan<
 
         let result = state.iter_scan();
         if result.is_err() {
-            drop_fdw_state(state.as_ptr());
+            // Don't drop — memcontext callback owns lifetime.
             (*node).fdw_state = ptr::null::<FdwState<E, W>>() as _;
         }
         if result.report_unwrap().is_some() {
@@ -1009,7 +1126,7 @@ pub(super) extern "C-unwind" fn re_scan_foreign_scan<
                 state.re_scan()
             };
             if result.is_err() {
-                drop_fdw_state(state.as_ptr());
+                // Don't drop — memcontext callback owns lifetime.
                 (*node).fdw_state = ptr::null::<FdwState<E, W>>() as _;
                 result.report_unwrap();
             }
@@ -1028,12 +1145,17 @@ pub(super) extern "C-unwind" fn end_foreign_scan<E: Into<ErrorReport>, W: Foreig
             return;
         }
 
-        // the scan state is actually not allocated by PG, but we use 'from_pg()'
-        // here just to tell PgBox don't free the state, instead we will handle
-        // drop the state by ourselves
+        // Call the FDW's end_scan hook (releases per-scan resources like
+        // open ODBC cursors / row buffers).
+        //
+        // DO NOT drop the FdwState here. The state is shared with the cached
+        // plan via fdw_private; dropping it would invalidate that pointer and
+        // cause use-after-free on the next EXECUTE of a generic plan (bug #2).
+        // Ownership is transferred to a MemoryContextCallback registered in
+        // begin_foreign_scan; PG calls the callback when the plan's memcontext
+        // is reset (DEALLOCATE / session end).
         let mut state = PgBox::<FdwState<E, W>>::from_pg(fdw_state);
         let result = state.end_scan();
-        drop_fdw_state(state.as_ptr());
         (*node).fdw_state = ptr::null::<FdwState<E, W>>() as _;
 
         result.report_unwrap();
