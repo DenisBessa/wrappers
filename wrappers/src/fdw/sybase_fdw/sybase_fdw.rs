@@ -53,19 +53,36 @@ fn apply_quals_selectivity(base_rows: i64, quals: &[Qual]) -> i64 {
     }
     let mut selectivity = 1.0_f64;
     for q in quals {
+        // Param-bound quals (correlated subquery) are evaluated at runtime —
+        // selectivity depends on the outer row's value, which we can't know
+        // during planning. We still apply *some* reduction (otherwise the
+        // rel looks huge and PG may pick worse plans), but a much smaller
+        // one than for literals: the goal is to avoid the inverse failure
+        // mode where this FT becomes a NL-inner Materialize while a much
+        // larger unfiltered FT becomes the outer — leading to a remote
+        // full-scan per outer row in correlated subqueries.
+        let is_param = q.param.is_some();
         let s = match q.operator.as_str() {
             // Equality + IN: very selective by default.
             "=" => {
                 if let Value::Array(items) = &q.value {
                     // `IN (...)` / `= ANY(ARRAY[...])`: roughly 0.005 per item.
                     (0.005_f64 * items.len() as f64).min(1.0)
+                } else if is_param {
+                    0.1
                 } else {
                     0.005
                 }
             }
             // Inequality / NULL tests / LIKE: PG-default ineq selectivity.
             "<>" | "!=" => 0.995,
-            "<" | "<=" | ">" | ">=" => 0.333,
+            "<" | "<=" | ">" | ">=" => {
+                if is_param {
+                    0.5
+                } else {
+                    0.333
+                }
+            }
             "is" => 0.005,
             "is not" => 0.995,
             "~~" | "!~~" | "~~*" | "!~~*" => 0.005,
