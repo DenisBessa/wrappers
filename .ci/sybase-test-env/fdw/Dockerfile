@@ -63,7 +63,11 @@ RUN chown -R postgres:postgres \
 
 # ODBC: deixa o template do FreeTDS pronto. O DSN concreto é injetado em
 # runtime pela configuração do servidor (CREATE SERVER ... OPTIONS).
-RUN printf '[FreeTDS]\nDescription = FreeTDS Driver\nDriver = /usr/lib/x86_64-linux-gnu/odbc/libtdsodbc.so\nSetup = /usr/lib/x86_64-linux-gnu/odbc/libtdsS.so\nFileUsage = 1\n' > /etc/odbcinst.ini
+# Resolve o multiarch triplet (x86_64-linux-gnu, aarch64-linux-gnu, …) na
+# build pra suportar tanto PG amd64 emulado quanto arm64 nativo no Apple
+# Silicon — `dpkg-architecture -qDEB_HOST_MULTIARCH` é a fonte canônica.
+RUN MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" \
+ && printf '[FreeTDS]\nDescription = FreeTDS Driver\nDriver = /usr/lib/%s/odbc/libtdsodbc.so\nSetup = /usr/lib/%s/odbc/libtdsS.so\nFileUsage = 1\n' "$MULTIARCH" "$MULTIARCH" > /etc/odbcinst.ini
 
 # Postgres config: relax shared_preload, ativar logging detalhado pro repro.
 RUN echo "shared_preload_libraries = 'wrappers'" >> /etc/postgresql/17/main/postgresql.conf \

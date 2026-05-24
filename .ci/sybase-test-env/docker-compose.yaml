@@ -28,7 +28,6 @@ services:
       dockerfile: Dockerfile
     image: sybase-fdw-test-postgres:dev
     container_name: sybase-fdw-test-postgres
-    platform: linux/amd64
     depends_on:
       sybase:
         condition: service_healthy

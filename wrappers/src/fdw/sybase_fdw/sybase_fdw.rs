@@ -1,8 +1,10 @@
 use odbc_api::{
-    Connection, ConnectionOptions, Cursor, Environment, ResultSetMetadata, buffers::TextRowSet,
+    BlockCursor, Connection, ConnectionOptions, Cursor, CursorImpl, Environment,
+    buffers::TextRowSet, handles::StatementImpl,
 };
 use pgrx::{PgBuiltInOids, PgOid, pg_sys::Oid, prelude::Date};
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::sync::{LazyLock, Mutex};
 
 use supabase_wrappers::prelude::*;
@@ -330,9 +332,182 @@ pub(super) fn deparse_aggregate_sybase(
     sql
 }
 
-// Store fetched rows
-struct FetchedRow {
-    values: Vec<Option<String>>,
+// Default batch size for streaming reads. Small enough that the underlying
+// `TextRowSet` (which allocates `batch_size * num_cols * max_str` bytes upfront)
+// stays modest even for wide tables (e.g. 143 cols × 4096 × 100 ≈ 60 MB), large
+// enough that the per-batch ODBC roundtrip overhead is amortized.
+const STREAM_BATCH_SIZE: usize = 100;
+
+// Maximum width per text column. Sybase strings beyond this are truncated by
+// the ODBC driver; matches the historical buffering implementation's choice.
+const STREAM_MAX_STR_LEN: usize = 4096;
+
+/// Holds an in-progress ODBC cursor across `iter_scan` calls.
+///
+/// Self-referential: the `BlockCursor` borrows the statement which borrows the
+/// `Connection`. We sidestep the lifetime issue by:
+///   1. Boxing the `Connection<'static>` for a stable heap address.
+///   2. Transmuting the cursor's borrow to `'static` (the real lifetime is
+///      tied to `_conn`, which lives as long as `StreamingScan`).
+///   3. Enforcing drop order via `Drop` so `block` (which holds the cursor and
+///      statement handle) is dropped before `_conn` is released.
+///
+/// The connection itself is genuinely `'static`-compatible because all
+/// connections in this module are derived from the [`ODBC_ENV`] `LazyLock`,
+/// which lives for the process.
+struct StreamingScan {
+    /// Owned `BlockCursor`. Holds the statement (which references the
+    /// connection) and the text-row buffer. Declared first so the explicit
+    /// `Drop` impl can run it down before `_conn`.
+    block: ManuallyDrop<BlockCursor<CursorImpl<StatementImpl<'static>>, TextRowSet>>,
+    /// Boxed so its address stays stable across moves of `StreamingScan`.
+    /// The `_` prefix marks that we never read it directly — the cursor in
+    /// `block` borrows from this connection internally.
+    _conn: Box<Connection<'static>>,
+    /// Rows from the most recently fetched batch, extracted into owned Strings
+    /// so the borrow on `block`'s buffer doesn't outlive the next `fetch()`.
+    current_batch: Vec<Vec<Option<String>>>,
+    pos: usize,
+    /// True once the cursor signaled end-of-result-set. Subsequent reads short-
+    /// circuit to `None` without touching the cursor.
+    eof: bool,
+}
+
+impl Drop for StreamingScan {
+    fn drop(&mut self) {
+        // FreeTDS requires the client to consume every row of the result set
+        // before `SQLCloseCursor` is called — otherwise the wire protocol
+        // gets out of sync and SQLCloseCursor panics with "Bad token from
+        // the server: Datastream processing out of sync". When iteration
+        // stops early (LIMIT, JOIN early-exit, planner SubPlan), drain the
+        // remaining batches before letting `block` drop. SQLCancel would be
+        // cheaper but odbc-api 8 doesn't expose it.
+        if !self.eof {
+            // SAFETY: `block` is still initialized at this point.
+            let block = unsafe { &mut *self.block };
+            while let Ok(Some(_)) = block.fetch() {
+                // Discard the batch; we only need the cursor consumed.
+            }
+        }
+        // SAFETY: drop `block` (which closes the cursor and statement
+        // handle) BEFORE `_conn` is released, because the statement handle
+        // borrows from the connection.
+        unsafe {
+            ManuallyDrop::drop(&mut self.block);
+        }
+        // `_conn` drops as a normal `Box<Connection<'static>>` after this
+        // function returns.
+    }
+}
+
+impl StreamingScan {
+    /// Open a streaming scan over `sql` against `conn`. Returns `None` if the
+    /// statement produced no result set (e.g. a DDL); for SELECTs always
+    /// returns `Some`.
+    fn open(conn: Connection<'static>, sql: &str) -> SybaseFdwResult<Option<Self>> {
+        let conn_box = Box::new(conn);
+        // SAFETY: `conn_box` is heap-allocated so its address is stable. We
+        // derive `conn_ref` from a raw pointer so the borrow checker doesn't
+        // tie its lifetime to `conn_box`'s lexical scope — without this,
+        // moving `conn_box` into `_conn` below conflicts with the (apparent)
+        // borrow held by the cursor returned from `execute`. The actual
+        // safety invariant is enforced at runtime by our `Drop` impl:
+        //   - `conn_box` lives until `StreamingScan` is dropped;
+        //   - `Drop` drops `block` (which holds the cursor and statement)
+        //     BEFORE `_conn` is released, so the statement handle is freed
+        //     while the connection is still valid.
+        let conn_ptr: *const Connection<'static> = &*conn_box;
+        let conn_ref: &Connection<'static> = unsafe { &*conn_ptr };
+        let cursor_opt = conn_ref.execute(sql, ())?;
+        let mut cursor = match cursor_opt {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let buffers =
+            TextRowSet::for_cursor(STREAM_BATCH_SIZE, &mut cursor, Some(STREAM_MAX_STR_LEN))?;
+        let block = cursor.bind_buffer(buffers)?;
+        // SAFETY: stretch the inner statement borrow lifetime from `&conn_box`
+        // (the implicit lifetime of `block`) to `'static`. Same justification
+        // as above; size and layout of `BlockCursor` do not depend on the
+        // lifetime parameter, so this `transmute` is a no-op at runtime.
+        let block_static: BlockCursor<CursorImpl<StatementImpl<'static>>, TextRowSet> =
+            unsafe { std::mem::transmute(block) };
+        Ok(Some(StreamingScan {
+            block: ManuallyDrop::new(block_static),
+            _conn: conn_box,
+            current_batch: Vec::new(),
+            pos: 0,
+            eof: false,
+        }))
+    }
+
+    /// Read the next row from the result set. Returns `None` on EOF.
+    fn next_row(&mut self) -> SybaseFdwResult<Option<&[Option<String>]>> {
+        if self.pos >= self.current_batch.len() {
+            if self.eof {
+                return Ok(None);
+            }
+            self.current_batch.clear();
+            self.pos = 0;
+            // SAFETY: `block` is initialized (see Drop). Mutable access here
+            // is exclusive (caller holds `&mut self`).
+            let block = &mut *self.block;
+            match block.fetch()? {
+                Some(buf) => {
+                    let n_rows = buf.num_rows();
+                    let n_cols = buf.num_cols();
+                    self.current_batch.reserve(n_rows);
+                    for row_idx in 0..n_rows {
+                        let mut row = Vec::with_capacity(n_cols);
+                        for col_idx in 0..n_cols {
+                            let v = buf
+                                .at(col_idx, row_idx)
+                                .map(|bytes| String::from_utf8_lossy(bytes).to_string());
+                            row.push(v);
+                        }
+                        self.current_batch.push(row);
+                    }
+                    if self.current_batch.is_empty() {
+                        // Empty batch — driver signaled "no more rows" by
+                        // returning a zero-row batch instead of `None`.
+                        self.eof = true;
+                        return Ok(None);
+                    }
+                }
+                None => {
+                    self.eof = true;
+                    return Ok(None);
+                }
+            }
+        }
+        let row = &self.current_batch[self.pos];
+        self.pos += 1;
+        Ok(Some(row.as_slice()))
+    }
+
+    /// Consume the stream and return the underlying `Connection` so it can
+    /// be re-cached for later scans. Drops the cursor first to release the
+    /// statement handle.
+    fn into_connection(self) -> Connection<'static> {
+        // Wrap the entire `self` in ManuallyDrop so the compiler-generated
+        // destructor for `self` is suppressed for every field. Then we drop
+        // what needs dropping (`block`) and read out what we want to keep
+        // (`_conn`). `current_batch` leaks until function return — fine, it's
+        // a small `Vec` that's owned by `self`, and the caller doesn't need
+        // it. The cursor handle (held by `block`) is released before `_conn`
+        // is touched, matching the Drop ordering invariant.
+        let mut me = ManuallyDrop::new(self);
+        unsafe {
+            ManuallyDrop::drop(&mut me.block);
+            // Drop `current_batch` explicitly — without ManuallyDrop on it,
+            // those `Vec` allocations would leak.
+            std::ptr::drop_in_place(&mut me.current_batch);
+            // Move the boxed connection out without dropping it.
+            let boxed = std::ptr::read(&me._conn);
+            // `me` itself is `ManuallyDrop`, so falling out of scope is safe.
+            *boxed
+        }
+    }
 }
 
 #[wrappers_fdw(
@@ -345,8 +520,14 @@ pub(crate) struct SybaseFdw {
     conn_str: String,
     table: String,
     tgt_cols: Vec<Column>,
-    scan_result: Vec<FetchedRow>,
-    iter_idx: usize,
+
+    // Active streaming scan, set by `execute_query` and consumed by
+    // `iter_scan`. Replaces the historical `scan_result: Vec<FetchedRow>`
+    // which materialised every matching row into Rust memory before
+    // returning the first one to Postgres — a pattern that OOM-killed
+    // supabase-db on prod when a CTE forced full-table SUM/GROUP BY over
+    // ~609k rows of `efentradaspag`.
+    stream: Option<StreamingScan>,
 
     // Lazy execution support for parameterized queries.
     // When quals contain parameters (from JOINs), we defer query execution
@@ -356,8 +537,10 @@ pub(crate) struct SybaseFdw {
     stored_sorts: Vec<Sort>,
     stored_limit: Option<Limit>,
 
-    // Cached ODBC connection, reused across re_scans to avoid
-    // connection overhead on correlated subqueries.
+    // Cached ODBC connection, reused across scans to avoid connection
+    // overhead on correlated subqueries. `execute_query` `take()`s it to
+    // hand ownership to `StreamingScan`; `end_scan` recovers it via
+    // `StreamingScan::into_connection`.
     cached_conn: Option<Connection<'static>>,
 
     // Aggregate pushdown is opt-in via server option `aggregate_pushdown=true`.
@@ -604,49 +787,54 @@ impl SybaseFdw {
         Ok(sql)
     }
 
+    /// Open a streaming cursor for `sql`. Replaces any in-progress stream.
+    ///
+    /// Connection management: we take the cached connection (or create one
+    /// if absent), hand it to `StreamingScan::open`, and store the resulting
+    /// stream. The connection is recovered later by `close_stream`.
     fn execute_query(&mut self, sql: &str) -> SybaseFdwResult<()> {
-        // Reuse cached connection or create a new one.
-        // We take() the connection out to avoid borrow conflicts with scan_result.
+        // Close any previous stream and recover its connection. This handles
+        // re-execution (e.g. parameterized scans where iter_scan triggers a
+        // late execute_query, or aggregate vs base-rel paths racing on the
+        // same state).
+        self.close_stream();
+
         let conn = match self.cached_conn.take() {
             Some(c) => c,
             None => connect_unlocked(&self.conn_str)?,
         };
 
-        let result = Self::fetch_rows(&conn, sql, &mut self.scan_result);
-
-        // Put the connection back for reuse (even on error, to attempt reuse)
-        self.cached_conn = Some(conn);
-
-        result
+        match StreamingScan::open(conn, sql) {
+            Ok(Some(stream)) => {
+                self.stream = Some(stream);
+                Ok(())
+            }
+            Ok(None) => {
+                // Statement produced no result set (DDL, etc.) — leave stream
+                // unset; `iter_scan` will return None on the first call.
+                // The connection was consumed; create a fresh one for the
+                // next scan.
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    fn fetch_rows(
-        conn: &Connection<'static>,
-        sql: &str,
-        scan_result: &mut Vec<FetchedRow>,
-    ) -> SybaseFdwResult<()> {
-        if let Some(mut cursor) = conn.execute(sql, ())? {
-            let num_cols = cursor.num_result_cols()? as usize;
-
-            let batch_size = 5000;
-            let mut buffers = TextRowSet::for_cursor(batch_size, &mut cursor, Some(4096))?;
-            let mut row_set_cursor = cursor.bind_buffer(&mut buffers)?;
-
-            while let Some(batch) = row_set_cursor.fetch()? {
-                for row_idx in 0..batch.num_rows() {
-                    let mut values = Vec::with_capacity(num_cols);
-                    for col_idx in 0..num_cols {
-                        let value = batch
-                            .at(col_idx, row_idx)
-                            .map(|bytes| String::from_utf8_lossy(bytes).to_string());
-                        values.push(value);
-                    }
-                    scan_result.push(FetchedRow { values });
-                }
+    /// Drop any in-progress stream. If the cursor was drained to EOF, the
+    /// underlying connection is recycled into `cached_conn` for the next
+    /// scan; if not (e.g. PG stopped iterating early because of LIMIT or a
+    /// JOIN early-exit), the connection is dropped — closing a FreeTDS
+    /// cursor mid-stream leaves the wire protocol out of sync ("Bad token
+    /// from the server: Datastream processing out of sync") on the next
+    /// query over the same connection.
+    fn close_stream(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            if stream.eof {
+                self.cached_conn = Some(stream.into_connection());
             }
+            // else: drop the whole StreamingScan including the connection;
+            // the next scan will open a fresh one.
         }
-
-        Ok(())
     }
 
     fn do_execute_query_with_stats(
@@ -712,8 +900,7 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
             conn_str,
             table: String::default(),
             tgt_cols: Vec::new(),
-            scan_result: Vec::new(),
-            iter_idx: 0,
+            stream: None,
             query_executed: false,
             stored_quals: Vec::new(),
             stored_sorts: Vec::new(),
@@ -874,8 +1061,7 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
     ) -> SybaseFdwResult<()> {
         self.table = require_option("table", options)?.to_string();
         self.tgt_cols = columns.to_vec();
-        self.iter_idx = 0;
-        self.scan_result.clear();
+        self.close_stream();
         self.query_executed = false;
 
         self.stored_quals = quals.to_vec();
@@ -916,35 +1102,55 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
             self.do_execute_query_with_stats(&quals, &sorts, &limit)?;
         }
 
-        if self.iter_idx >= self.scan_result.len() {
-            return Ok(None);
-        }
+        // Pull the next row from the streaming cursor. `next_row` handles
+        // batch refills internally; it returns `None` once the result set
+        // is exhausted.
+        let stream = match self.stream.as_mut() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
 
-        let src_row = &self.scan_result[self.iter_idx];
+        // Collect the raw values out of the borrow before calling
+        // `value_to_cell` (which can't run while `stream` is borrowed).
+        let owned_values: Vec<Option<String>> = match stream.next_row()? {
+            Some(values) => values.to_vec(),
+            None => return Ok(None),
+        };
+
         let mut tgt_row = Row::new();
-
         for (col_idx, tgt_col) in self.tgt_cols.iter().enumerate() {
-            let value = src_row.values.get(col_idx).and_then(|v| v.as_deref());
+            let value = owned_values.get(col_idx).and_then(|v| v.as_deref());
             let cell = value_to_cell(value, tgt_col.type_oid)?;
             tgt_row.push(&tgt_col.name, cell);
         }
 
         row.replace_with(tgt_row);
-        self.iter_idx += 1;
-
         Ok(Some(()))
     }
 
     fn re_scan(&mut self) -> SybaseFdwResult<()> {
-        // Upstream's re_scan_foreign_scan only invokes re_scan when the
-        // parameter fingerprint is unchanged — fresh-param scans go through
-        // end_scan + begin_scan. So we only need to rewind the iterator.
-        self.iter_idx = 0;
+        // With streaming we cannot rewind the ODBC cursor — re-executing the
+        // remote query is the only correct behavior. Upstream's
+        // re_scan_foreign_scan only invokes re_scan when the parameter
+        // fingerprint is unchanged (fresh-param scans go through
+        // end_scan + begin_scan), so this is the in-loop rescan path.
+        self.close_stream();
+        self.query_executed = false;
+
+        if self.stored_quals.iter().all(|q| q.param.is_none()) {
+            let quals = self.stored_quals.clone();
+            let sorts = self.stored_sorts.clone();
+            let limit = self.stored_limit.clone();
+            self.do_execute_query_with_stats(&quals, &sorts, &limit)?;
+        }
+        // Parameterized rescans fall back to the lazy path in `iter_scan`,
+        // matching `begin_scan`'s deferred-execution behavior.
+
         Ok(())
     }
 
     fn end_scan(&mut self) -> SybaseFdwResult<()> {
-        self.scan_result.clear();
+        self.close_stream();
         Ok(())
     }
 
@@ -974,8 +1180,7 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
         options: &HashMap<String, String>,
     ) -> SybaseFdwResult<()> {
         self.table = require_option("table", options)?.to_string();
-        self.iter_idx = 0;
-        self.scan_result.clear();
+        self.close_stream();
         self.query_executed = false;
         self.stored_quals.clear();
         self.stored_sorts.clear();
