@@ -384,6 +384,14 @@ pub(super) extern "C-unwind" fn get_foreign_upper_paths<
         // were extracted but never passed through to the executor.
         (*output_rel).fdw_private = state.into_pg() as _;
 
+        // Ensure output_rel.rows is non-zero before adding a path. With
+        // rows=0 the planner's downstream cost arithmetic can divide by zero
+        // (or multiply by zero) and produce nonsensical sizes for later
+        // palloc calls.
+        if (*output_rel).rows < 1.0 {
+            (*output_rel).rows = rows as f64;
+        }
+
         // Create the foreign upper path
         let path = pg_sys::create_foreign_upper_path(
             root,

@@ -543,12 +543,13 @@ pub(crate) struct SybaseFdw {
     // `StreamingScan::into_connection`.
     cached_conn: Option<Connection<'static>>,
 
-    // Aggregate pushdown is opt-in via server option `aggregate_pushdown=true`.
-    // The deparse and execution paths are exercised by unit tests, but the
-    // planner integration has shown allocation issues under some PG versions
-    // (Rosetta-emulated x86 hits a >90 TB phantom allocation during upper-rel
-    // planning). Gating keeps the existing scan behavior unchanged for
-    // anyone who hasn't explicitly opted in.
+    // Aggregate pushdown can be disabled per-server with `aggregate_pushdown=false`.
+    // Default is ON: the upper-rel planner integration was previously gated
+    // because the join hooks misidentified upper rels as join scans (scanrelid=0
+    // for both) and corrupted state, causing a >90 TB phantom palloc that
+    // aborted the backend during planning. The discriminator marker added to
+    // join_state serialization (see join.rs::JOIN_PRIVATE_MARKER) lets the
+    // begin/iterate/end callbacks tell them apart, so pushdown is safe by default.
     aggregate_pushdown_enabled: bool,
 }
 
@@ -890,11 +891,16 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
             )
         };
 
+        // Default ON; set `aggregate_pushdown=false` to fall back to local
+        // aggregation. Without pushdown, queries like the prod CTE that
+        // materialised SUM/GROUP BY over ~600k rows of efservicospag (see
+        // sybase_fdw_oom_buffering memory) still buffer every row in the
+        // backend and risk OOM regardless of streaming.
         let aggregate_pushdown_enabled = server
             .options
             .get("aggregate_pushdown")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or(false);
+            .map(|v| !(v.eq_ignore_ascii_case("false") || v == "0"))
+            .unwrap_or(true);
 
         Ok(SybaseFdw {
             conn_str,

@@ -632,10 +632,27 @@ fn deparse_join_sql(
 // Serialization (same pattern as framework's SerdeList)
 // ---------------------------------------------------------------------------
 
+// Magic marker emitted as the first element of the join scan's fdw_private
+// list, so begin/iterate/end can distinguish a join plan (scanrelid=0) from
+// an aggregate-pushdown upper-rel plan (also scanrelid=0). Without it both
+// shapes are List<Const(int8)> of length 1 and we'd interpret the
+// framework's serialized FdwState pointer as a *mut JoinScanState — corrupted
+// reads then feed garbage sizes into palloc and abort the backend.
+const JOIN_PRIVATE_MARKER: i64 = 0x5359_4253_4A4F_494E; // 'SYBSJOIN'
+
 unsafe fn serialize_join_state(state: *mut JoinScanState) -> *mut pg_sys::List {
     unsafe {
         pgrx::memcx::current_context(|mcx| {
             let mut ret = List::<*mut c_void>::Nil;
+            let marker = pg_sys::makeConst(
+                pg_sys::INT8OID,
+                -1,
+                pg_sys::InvalidOid,
+                8,
+                JOIN_PRIVATE_MARKER.into_datum().unwrap(),
+                false,
+                true,
+            );
             let val = state as i64;
             let cst = pg_sys::makeConst(
                 pg_sys::INT8OID,
@@ -646,24 +663,44 @@ unsafe fn serialize_join_state(state: *mut JoinScanState) -> *mut pg_sys::List {
                 false,
                 true,
             );
+            ret.unstable_push_in_context(marker as *mut c_void, mcx);
             ret.unstable_push_in_context(cst as *mut c_void, mcx);
             ret.into_ptr()
         })
     }
 }
 
+/// Reads the join state pointer from `list`. Returns null if `list` is not a
+/// join private list — letting the caller fall back to the framework's
+/// scan/upper-rel callbacks instead of misinterpreting their state.
 unsafe fn deserialize_join_state(list: *mut pg_sys::List) -> *mut JoinScanState {
     unsafe {
         pgrx::memcx::current_context(|mcx| {
-            if let Some(list) = List::<*mut c_void>::downcast_ptr_in_memcx(list, mcx)
-                && let Some(cst_ptr) = list.get(0)
-            {
-                let cst = *(*cst_ptr as *mut pg_sys::Const);
-                if let Some(ptr) = i64::from_datum(cst.constvalue, cst.constisnull) {
-                    return ptr as *mut JoinScanState;
-                }
+            let Some(list) = List::<*mut c_void>::downcast_ptr_in_memcx(list, mcx) else {
+                return ptr::null_mut();
+            };
+            // Need at least [marker, ptr]; framework's SerdeList emits length 1.
+            if list.len() < 2 {
+                return ptr::null_mut();
             }
-            ptr::null_mut()
+            let Some(marker_ptr) = list.get(0) else {
+                return ptr::null_mut();
+            };
+            let marker_const = *(*marker_ptr as *mut pg_sys::Const);
+            let marker = match i64::from_datum(marker_const.constvalue, marker_const.constisnull) {
+                Some(m) => m,
+                None => return ptr::null_mut(),
+            };
+            if marker != JOIN_PRIVATE_MARKER {
+                return ptr::null_mut();
+            }
+            let Some(cst_ptr) = list.get(1) else {
+                return ptr::null_mut();
+            };
+            let cst = *(*cst_ptr as *mut pg_sys::Const);
+            i64::from_datum(cst.constvalue, cst.constisnull)
+                .map(|p| p as *mut JoinScanState)
+                .unwrap_or(ptr::null_mut())
         })
     }
 }
@@ -744,15 +781,19 @@ unsafe extern "C-unwind" fn sybase_begin_foreign_scan(
         let plan = (*node).ss.ps.plan as *mut pg_sys::ForeignScan;
         let scanrelid = (*plan).scan.scanrelid;
 
-        if scanrelid != 0 {
+        // scanrelid != 0 → base-rel scan, hand off.
+        // scanrelid == 0 covers BOTH join and aggregate-pushdown upper rel —
+        // we have to peek at fdw_private to tell them apart. deserialize_join_state
+        // returns null when the marker isn't ours (framework FdwState).
+        let state_ptr = if scanrelid == 0 {
+            deserialize_join_state((*plan).fdw_private as _)
+        } else {
+            ptr::null_mut()
+        };
+
+        if state_ptr.is_null() {
             let orig = ORIGINAL_CALLBACKS.get().unwrap();
             return (orig.begin_foreign_scan.unwrap())(node, eflags);
-        }
-
-        // --- Join scan ---
-        let state_ptr = deserialize_join_state((*plan).fdw_private as _);
-        if state_ptr.is_null() {
-            pgrx::error!("SybaseFdw join: failed to deserialize state");
         }
 
         if eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as c_int > 0 {
@@ -850,7 +891,12 @@ unsafe extern "C-unwind" fn sybase_iterate_foreign_scan(
         let plan = (*node).ss.ps.plan as *mut pg_sys::ForeignScan;
         let scanrelid = (*plan).scan.scanrelid;
 
-        if scanrelid != 0 {
+        // See sybase_begin_foreign_scan: scanrelid==0 alone doesn't prove this
+        // is a join scan, so check the marker. Falling through to the original
+        // callback handles aggregate-pushdown upper rels (also scanrelid==0).
+        let is_join = scanrelid == 0
+            && !deserialize_join_state((*plan).fdw_private as _).is_null();
+        if !is_join {
             let orig = ORIGINAL_CALLBACKS.get().unwrap();
             return (orig.iterate_foreign_scan.unwrap())(node);
         }
@@ -905,7 +951,9 @@ unsafe extern "C-unwind" fn sybase_re_scan_foreign_scan(node: *mut pg_sys::Forei
         let plan = (*node).ss.ps.plan as *mut pg_sys::ForeignScan;
         let scanrelid = (*plan).scan.scanrelid;
 
-        if scanrelid != 0 {
+        let is_join = scanrelid == 0
+            && !deserialize_join_state((*plan).fdw_private as _).is_null();
+        if !is_join {
             let orig = ORIGINAL_CALLBACKS.get().unwrap();
             return (orig.re_scan_foreign_scan.unwrap())(node);
         }
@@ -928,8 +976,10 @@ unsafe extern "C-unwind" fn sybase_explain_foreign_scan(
         let plan = (*node).ss.ps.plan as *mut pg_sys::ForeignScan;
         let scanrelid = (*plan).scan.scanrelid;
 
-        if scanrelid != 0 {
-            // Base table scan: delegate to original framework callback
+        let is_join = scanrelid == 0
+            && !deserialize_join_state((*plan).fdw_private as _).is_null();
+        if !is_join {
+            // Base table scan or aggregate-pushdown upper rel: delegate to framework.
             if let Some(orig_fn) = ORIGINAL_CALLBACKS.get().unwrap().explain_foreign_scan {
                 return orig_fn(node, es);
             }
@@ -959,7 +1009,9 @@ unsafe extern "C-unwind" fn sybase_end_foreign_scan(node: *mut pg_sys::ForeignSc
         let plan = (*node).ss.ps.plan as *mut pg_sys::ForeignScan;
         let scanrelid = (*plan).scan.scanrelid;
 
-        if scanrelid != 0 {
+        let is_join = scanrelid == 0
+            && !deserialize_join_state((*plan).fdw_private as _).is_null();
+        if !is_join {
             let orig = ORIGINAL_CALLBACKS.get().unwrap();
             return (orig.end_foreign_scan.unwrap())(node);
         }

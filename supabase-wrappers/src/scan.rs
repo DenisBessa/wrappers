@@ -653,7 +653,18 @@ pub(super) extern "C-unwind" fn get_foreign_plan<E: Into<ErrorReport>, W: Foreig
         // SYBASE FORK END
 
         // make foreign scan plan
-        let scan_clauses = pg_sys::extract_actual_clauses(scan_clauses, false);
+        //
+        // For upper relations (aggregate pushdown), postgres_fdw asserts
+        // `!scan_clauses` — all conditions go into remote/local conds and the
+        // scan plan carries no qualifier list. Mirror that here: passing
+        // non-NIL scan_clauses for an upper rel causes set_plan_references to
+        // walk a target list whose Vars can't be resolved, eventually feeding
+        // garbage sizes into palloc and aborting the backend.
+        let scan_clauses = if (*baserel).reloptkind == pg_sys::RelOptKind::RELOPT_UPPER_REL {
+            ptr::null_mut()
+        } else {
+            pg_sys::extract_actual_clauses(scan_clauses, false)
+        };
 
         // Aggregate pushdown: state.aggregates was populated by upper.rs via the
         // shared FdwState pointer (input_rel.fdw_private and output_rel.fdw_private
@@ -739,7 +750,15 @@ pub(super) extern "C-unwind" fn get_foreign_plan<E: Into<ErrorReport>, W: Foreig
             }
             state.tgts = new_tgts;
 
-            (agg_tlist, fdw_scan_tlist)
+            // Pass the PG-provided `tlist` as the plan's scan tlist and our
+            // hand-built copy as fdw_scan_tlist. This matches postgres_fdw:
+            //   make_foreignscan(tlist, ..., fdw_scan_tlist=build_tlist_to_deparse(foreignrel), ...);
+            // Building a separate plan tlist by walking reltarget exprs with
+            // bare makeTargetEntry breaks set_plan_references downstream —
+            // Vars inside Aggref nodes can't be resolved against fdw_scan_tlist
+            // and the planner ends up dereferencing garbage as a Size for
+            // palloc, aborting the backend.
+            (tlist, fdw_scan_tlist)
         } else {
             (tlist, ptr::null_mut())
         };

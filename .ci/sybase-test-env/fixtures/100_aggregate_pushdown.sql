@@ -9,6 +9,11 @@
 -- O EXPLAIN VERBOSE deve mostrar:
 --   Foreign Scan ... with Wrappers: aggregates = [...] e group_by = [...]
 -- (sem rescanear o FT em loop e sem HashAggregate local).
+--
+-- Pushdown é default-on desde que o discriminador JOIN_PRIVATE_MARKER em
+-- join.rs separou upper rel (agg, scanrelid=0) de join rel (scanrelid=0
+-- também) — antes disso sybase_begin_foreign_scan interpretava o FdwState
+-- como JoinScanState e gerava phantom palloc de ~187 TB no planner.
 -- @expect: ok
 
 BEGIN;
