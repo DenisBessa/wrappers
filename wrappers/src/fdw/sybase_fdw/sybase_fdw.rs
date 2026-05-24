@@ -35,6 +35,47 @@ pub(super) fn connect_unlocked(conn_str: &str) -> Result<Connection<'static>, od
 static ROW_COUNT_CACHE: LazyLock<Mutex<HashMap<String, i64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Apply PG-style selectivity defaults to a base row count given a set of
+/// WHERE quals. Mirrors `DEFAULT_EQ_SEL` (0.005) and `DEFAULT_INEQ_SEL`
+/// (0.3333) from `src/include/utils/selfuncs.h`, used by the planner when no
+/// column statistics are available — which is always the case for FTs.
+///
+/// Without this, get_rel_size returns the full table count regardless of
+/// WHERE clauses, so multi-FT joins explode into trillion-row estimates,
+/// pushing the planner toward NestedLoop+LATERAL with thousands of per-row
+/// remote round-trips. See the slow-query investigation in
+/// `.ci/sybase-test-env/fixtures/090_*` for the case that motivated this.
+fn apply_quals_selectivity(base_rows: i64, quals: &[Qual]) -> i64 {
+    if quals.is_empty() {
+        return base_rows;
+    }
+    let mut selectivity = 1.0_f64;
+    for q in quals {
+        let s = match q.operator.as_str() {
+            // Equality + IN: very selective by default.
+            "=" => {
+                if let Value::Array(items) = &q.value {
+                    // `IN (...)` / `= ANY(ARRAY[...])`: roughly 0.005 per item.
+                    (0.005_f64 * items.len() as f64).min(1.0)
+                } else {
+                    0.005
+                }
+            }
+            // Inequality / NULL tests / LIKE: PG-default ineq selectivity.
+            "<>" | "!=" => 0.995,
+            "<" | "<=" | ">" | ">=" => 0.333,
+            "is" => 0.005,
+            "is not" => 0.995,
+            "~~" | "!~~" | "~~*" | "!~~*" => 0.005,
+            _ => 1.0, // unknown operator → no opinion
+        };
+        selectivity *= s;
+    }
+    // Clamp to at least 1 row — 0 rows confuses the planner ("this FT is
+    // empty, no need to join").
+    ((base_rows as f64 * selectivity).round() as i64).max(1)
+}
+
 // Convert ODBC value to Cell based on target column type
 pub(super) fn value_to_cell(value: Option<&str>, type_oid: Oid) -> SybaseFdwResult<Option<Cell>> {
     let value = match value {
@@ -588,7 +629,7 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
 
     fn get_rel_size(
         &mut self,
-        _quals: &[Qual],
+        quals: &[Qual],
         columns: &[Column],
         _sorts: &[Sort],
         _limit: &Option<Limit>,
@@ -601,12 +642,13 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
             } else {
                 (columns.len() * 50) as i32
             };
-            return Ok((rows, width));
+            return Ok((apply_quals_selectivity(rows, quals), width));
         }
 
         let table = options.get("table").cloned().unwrap_or_default();
 
-        // Check cache first
+        // Check cache first. The cache holds the BASE row count (without
+        // qual selectivity applied) so we can recompute per-query selectivity.
         if let Ok(cache) = ROW_COUNT_CACHE.lock() {
             if let Some(&count) = cache.get(&table) {
                 let width = if columns.is_empty() {
@@ -614,7 +656,7 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
                 } else {
                     (columns.len() * 50) as i32
                 };
-                return Ok((count, width));
+                return Ok((apply_quals_selectivity(count, quals), width));
             }
         }
 
@@ -700,10 +742,22 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
             elapsed.as_secs_f64()
         );
 
-        // Cache the result
+        // Cache the BASE count (no quals applied yet).
         if let Ok(mut cache) = ROW_COUNT_CACHE.lock() {
-            cache.insert(table, rows);
+            cache.insert(table.clone(), rows);
         }
+
+        // Apply qual selectivity (PG defaults from selfuncs.h).
+        //
+        // Without column stats, PG falls back to DEFAULT_EQ_SEL=0.005,
+        // DEFAULT_INEQ_SEL=0.3333. For Foreign Tables there are no stats at
+        // all, so the planner would otherwise treat every WHERE as
+        // non-restrictive (selectivity=1.0) and estimate full tables on every
+        // join, producing astronomical row counts (37e12 was observed on a
+        // 4-FT join, leading the planner to pick NestedLoop-LATERAL with
+        // ~22k remote round-trips). Apply these defaults manually so the
+        // join cardinalities stay sane.
+        let rows = apply_quals_selectivity(rows, quals);
 
         let width = if columns.is_empty() {
             100
