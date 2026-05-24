@@ -96,7 +96,8 @@ DROP FOREIGN TABLE IF EXISTS dominio.focargos_slow CASCADE;
 CREATE FOREIGN TABLE dominio.focargos_slow (
     codi_emp    integer NOT NULL,
     i_cargos    integer NOT NULL,
-    nome        text
+    nome        text,
+    cbo_2002    integer
 ) SERVER sybase_test_server
   OPTIONS (table 'bethadba.focargos');
 
@@ -107,6 +108,128 @@ CREATE FOREIGN TABLE dominio.fodepto_slow (
     nome        text
 ) SERVER sybase_test_server
   OPTIONS (table 'bethadba.fodepto');
+
+-- ============================================================================
+-- Módulo de Folha (Payroll). Espelha a topologia em que os ex-pg_tests
+-- consumiam tabelas Sybase reais — agora sustentado pelo schema em
+-- .ci/sybase-test-env/sql/01_schema.sql + 02_data.sql.
+-- ============================================================================
+
+DROP FOREIGN TABLE IF EXISTS dominio.foferias_aquisitivos_slow CASCADE;
+CREATE FOREIGN TABLE dominio.foferias_aquisitivos_slow (
+    codi_emp                integer NOT NULL,
+    i_empregados            integer NOT NULL,
+    i_ferias_aquisitivos    integer NOT NULL,
+    data_inicio             date,
+    data_fim                date,
+    dias_direito            numeric,
+    dias_gozados            numeric,
+    dias_abono              numeric,
+    limite_para_gozo        date
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.foferias_aquisitivos');
+
+DROP FOREIGN TABLE IF EXISTS dominio.foferias_programacao_slow CASCADE;
+CREATE FOREIGN TABLE dominio.foferias_programacao_slow (
+    codi_emp                integer NOT NULL,
+    i_empregados            integer NOT NULL,
+    gozo_inicio             date,
+    dias_gozo               numeric,
+    i_ferias_aquisitivos    integer NOT NULL
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.foferias_programacao');
+
+DROP FOREIGN TABLE IF EXISTS dominio.foferias_slow CASCADE;
+CREATE FOREIGN TABLE dominio.foferias_slow (
+    codi_emp           integer NOT NULL,
+    i_empregados       integer NOT NULL,
+    inicio_aquisitivo  date,
+    fim_aquisitivo     date,
+    inicio_gozo        date,
+    fim_gozo           date,
+    dias_ferias        integer,
+    data_aviso         date,
+    data_pagto         date,
+    proventos          numeric,
+    descontos          numeric
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.foferias');
+
+DROP FOREIGN TABLE IF EXISTS dominio.fobancos_slow CASCADE;
+CREATE FOREIGN TABLE dominio.fobancos_slow (
+    i_bancos    integer NOT NULL,
+    numero      integer NOT NULL,
+    agencia     text NOT NULL,
+    nome        text NOT NULL
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.fobancos');
+
+DROP FOREIGN TABLE IF EXISTS dominio.foeventos_slow CASCADE;
+CREATE FOREIGN TABLE dominio.foeventos_slow (
+    codi_emp    integer NOT NULL,
+    i_eventos   integer NOT NULL,
+    nome        text NOT NULL
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.foeventos');
+
+DROP FOREIGN TABLE IF EXISTS dominio.foeventosbases_slow CASCADE;
+CREATE FOREIGN TABLE dominio.foeventosbases_slow (
+    codi_emp    integer NOT NULL,
+    i_eventos   integer NOT NULL,
+    i_cadbases  integer NOT NULL
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.foeventosbases');
+
+DROP FOREIGN TABLE IF EXISTS dominio.forescisoes_slow CASCADE;
+CREATE FOREIGN TABLE dominio.forescisoes_slow (
+    codi_emp        integer NOT NULL,
+    i_empregados    integer NOT NULL,
+    demissao        date,
+    motivo_esocial  integer
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.forescisoes');
+
+DROP FOREIGN TABLE IF EXISTS dominio.foccustos_slow CASCADE;
+CREATE FOREIGN TABLE dominio.foccustos_slow (
+    codi_emp    integer NOT NULL,
+    i_ccustos   integer NOT NULL,
+    nome        text
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.foccustos');
+
+DROP FOREIGN TABLE IF EXISTS dominio.foafastamentos_tipos_slow CASCADE;
+CREATE FOREIGN TABLE dominio.foafastamentos_tipos_slow (
+    i_afastamentos  integer NOT NULL,
+    descricao       text
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.foafastamentos_tipos');
+
+-- FOVCHEQUE é VIEW no Sybase (sys.systable.count = 0): view_estimated_rows
+-- evita que o planner trate como zero linhas e produza plano horrível.
+DROP FOREIGN TABLE IF EXISTS dominio.fovcheque_slow CASCADE;
+CREATE FOREIGN TABLE dominio.fovcheque_slow (
+    cp_tipo         smallint NOT NULL,
+    i_empregados    integer NOT NULL,
+    nome            text NOT NULL,
+    i_bancos        integer,
+    codi_emp        integer NOT NULL,
+    cp_tipo_process integer NOT NULL,
+    competencia     date,
+    cp_valor        numeric NOT NULL,
+    cp_data_pagto   date NOT NULL
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.fovcheque', view_estimated_rows '500000');
+
+-- FOMOVTO também é VIEW; mesmo tratamento.
+DROP FOREIGN TABLE IF EXISTS dominio.fomovto_slow CASCADE;
+CREATE FOREIGN TABLE dominio.fomovto_slow (
+    codi_emp        integer NOT NULL,
+    i_empregados    integer NOT NULL,
+    i_eventos       integer NOT NULL,
+    data            date NOT NULL,
+    valor_cal       numeric NOT NULL
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.fomovto', view_estimated_rows '1000000');
 
 -- ============================================================================
 -- MATERIALIZED VIEWS (sem sufixo) — cache local do que está no Sybase.

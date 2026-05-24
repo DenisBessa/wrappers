@@ -255,6 +255,81 @@ pub(super) fn deparse_qual_to_sybase(qual: &Qual, fmt: &mut SybaseCellFormatter)
     qual.deparse_with_fmt(fmt)
 }
 
+/// Render a single aggregate function as Sybase SQL.
+///
+/// Sybase SQL Anywhere accepts the same syntax as ANSI SQL for the aggregates
+/// we push down (COUNT, SUM, AVG, MIN, MAX) — so we delegate the basic shape
+/// to the framework's `Aggregate::deparse()` and only diverge for the alias
+/// form. The remote query never quotes column names (matches the rest of the
+/// Sybase FDW: identifiers are written unquoted, relying on Sybase's
+/// case-insensitive resolution).
+pub(super) fn deparse_agg_sybase(agg: &Aggregate) -> String {
+    agg.deparse()
+}
+
+pub(super) fn deparse_agg_with_alias_sybase(agg: &Aggregate) -> String {
+    format!("{} AS {}", deparse_agg_sybase(agg), agg.alias)
+}
+
+/// Build the SQL for an aggregate scan pushed down to Sybase.
+///
+/// Without aggregate pushdown, queries like
+/// `SELECT codi_emp, SUM(vpag_entp) FROM efentradaspag WHERE ... GROUP BY codi_emp`
+/// drag every matching row across the ODBC connection so Postgres can
+/// aggregate locally. For a CTE materialising hundreds of thousands of rows
+/// from `efentradaspag` (observed in prod) this buffers the entire result
+/// set in `scan_result: Vec<FetchedRow>` and OOM-kills the backend. Pushing
+/// SUM/COUNT/MIN/MAX/AVG (+ GROUP BY) down to Sybase keeps the memory
+/// footprint bounded by the cardinality of the group key.
+///
+/// `tgt_cols` (set in `begin_aggregate_scan`) must mirror this SELECT order
+/// exactly — group-by columns first, then aggregate aliases — so that
+/// `iter_scan` can read each value by column name.
+pub(super) fn deparse_aggregate_sybase(
+    table: &str,
+    aggregates: &[Aggregate],
+    group_by: &[Column],
+    quals: &[Qual],
+) -> String {
+    let mut select_items: Vec<String> = group_by.iter().map(|c| c.name.clone()).collect();
+    for agg in aggregates {
+        select_items.push(deparse_agg_with_alias_sybase(agg));
+    }
+
+    let mut sql = format!(
+        "SELECT {} FROM {} AS _wrappers_tbl",
+        select_items.join(", "),
+        table
+    );
+
+    // Keep every pushed-down qual: with aggregate pushdown there is no lower
+    // ForeignScan left to re-apply filters locally, so dropping any qual
+    // here would silently widen the aggregate.
+    if !quals.is_empty() {
+        let mut fmt = SybaseCellFormatter {};
+        let cond = quals
+            .iter()
+            .map(|q| deparse_qual_to_sybase(q, &mut fmt))
+            .collect::<Vec<String>>()
+            .join(" AND ");
+
+        if !cond.is_empty() {
+            sql.push_str(&format!(" WHERE {cond}"));
+        }
+    }
+
+    if !group_by.is_empty() {
+        let cols = group_by
+            .iter()
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!(" GROUP BY {cols}"));
+    }
+
+    sql
+}
+
 // Store fetched rows
 struct FetchedRow {
     values: Vec<Option<String>>,
@@ -284,6 +359,14 @@ pub(crate) struct SybaseFdw {
     // Cached ODBC connection, reused across re_scans to avoid
     // connection overhead on correlated subqueries.
     cached_conn: Option<Connection<'static>>,
+
+    // Aggregate pushdown is opt-in via server option `aggregate_pushdown=true`.
+    // The deparse and execution paths are exercised by unit tests, but the
+    // planner integration has shown allocation issues under some PG versions
+    // (Rosetta-emulated x86 hits a >90 TB phantom allocation during upper-rel
+    // planning). Gating keeps the existing scan behavior unchanged for
+    // anyone who hasn't explicitly opted in.
+    aggregate_pushdown_enabled: bool,
 }
 
 impl SybaseFdw {
@@ -619,6 +702,12 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
             )
         };
 
+        let aggregate_pushdown_enabled = server
+            .options
+            .get("aggregate_pushdown")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
+
         Ok(SybaseFdw {
             conn_str,
             table: String::default(),
@@ -630,6 +719,7 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
             stored_sorts: Vec::new(),
             stored_limit: None,
             cached_conn: None,
+            aggregate_pushdown_enabled,
         })
     }
 
@@ -855,6 +945,59 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
 
     fn end_scan(&mut self) -> SybaseFdwResult<()> {
         self.scan_result.clear();
+        Ok(())
+    }
+
+    fn supported_aggregates(&self) -> Vec<AggregateKind> {
+        if !self.aggregate_pushdown_enabled {
+            return Vec::new();
+        }
+        vec![
+            AggregateKind::Count,
+            AggregateKind::CountColumn,
+            AggregateKind::Sum,
+            AggregateKind::Avg,
+            AggregateKind::Min,
+            AggregateKind::Max,
+        ]
+    }
+
+    fn supports_group_by(&self) -> bool {
+        self.aggregate_pushdown_enabled
+    }
+
+    fn begin_aggregate_scan(
+        &mut self,
+        aggregates: &[Aggregate],
+        group_by: &[Column],
+        quals: &[Qual],
+        options: &HashMap<String, String>,
+    ) -> SybaseFdwResult<()> {
+        self.table = require_option("table", options)?.to_string();
+        self.iter_idx = 0;
+        self.scan_result.clear();
+        self.query_executed = false;
+        self.stored_quals.clear();
+        self.stored_sorts.clear();
+        self.stored_limit = None;
+
+        // tgt_cols must match the SELECT order exactly: group-by columns
+        // first, then aggregate result columns named by their aliases.
+        // iter_scan uses tgt_col.name to read the matching value from
+        // the ODBC result row.
+        let mut tgt_cols: Vec<Column> = group_by.to_vec();
+        for (i, agg) in aggregates.iter().enumerate() {
+            tgt_cols.push(Column {
+                name: agg.alias.clone(),
+                num: group_by.len() + i + 1,
+                type_oid: agg.type_oid,
+            });
+        }
+        self.tgt_cols = tgt_cols;
+
+        let sql = deparse_aggregate_sybase(&self.table, aggregates, group_by, quals);
+        self.execute_query(&sql)?;
+        self.query_executed = true;
         Ok(())
     }
 
