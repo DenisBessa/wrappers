@@ -1,5 +1,4 @@
-#[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
+#[cfg(test)]
 mod deparse_qual_unit_tests {
     use super::super::sybase_fdw::{SybaseCellFormatter, deparse_qual_to_sybase};
     use supabase_wrappers::prelude::{Cell, Qual, Value};
@@ -15,7 +14,7 @@ mod deparse_qual_unit_tests {
     }
 
     // IN (...) — the bug fix
-    #[pgrx::pg_test]
+    #[test]
     fn renders_in_for_integer_array() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual(
@@ -30,14 +29,14 @@ mod deparse_qual_unit_tests {
         );
     }
 
-    #[pgrx::pg_test]
+    #[test]
     fn renders_in_for_single_value_array() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual("id", "=", Value::Array(vec![Cell::I64(42)]), true);
         assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "id IN (42)");
     }
 
-    #[pgrx::pg_test]
+    #[test]
     fn renders_in_for_string_array() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual(
@@ -52,9 +51,45 @@ mod deparse_qual_unit_tests {
         assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "tipo IN ('A', 'B')");
     }
 
-    // NOT IN (Postgres rewrites `NOT IN` as `<> ALL`; useOr=false → no array path,
-    // but defensive coverage in case the planner emits `<>` with useOr=true).
-    #[pgrx::pg_test]
+    // NOT IN — Postgres emits `<>` with useOr=false (semantics: `<> ALL`).
+    // Without this branch the framework's deparse_with_fmt panics
+    // (`Value::Array(_) => unreachable!()`), surfaced in prod as
+    // XX000 "internal error: entered unreachable code".
+    #[test]
+    fn renders_not_in_for_integer_array_no_or() {
+        let mut fmt = SybaseCellFormatter {};
+        let q = qual(
+            "situacao_ent",
+            "<>",
+            Value::Array(vec![Cell::I32(1), Cell::I32(2), Cell::I32(3)]),
+            false,
+        );
+        assert_eq!(
+            deparse_qual_to_sybase(&q, &mut fmt),
+            "situacao_ent NOT IN (1, 2, 3)"
+        );
+    }
+
+    #[test]
+    fn renders_not_in_for_string_array_no_or() {
+        let mut fmt = SybaseCellFormatter {};
+        let q = qual(
+            "situacao_ent",
+            "<>",
+            Value::Array(vec![
+                Cell::String("X".to_string()),
+                Cell::String("Y".to_string()),
+            ]),
+            false,
+        );
+        assert_eq!(
+            deparse_qual_to_sybase(&q, &mut fmt),
+            "situacao_ent NOT IN ('X', 'Y')",
+        );
+    }
+
+    // Defensive: in case the planner ever emits `<>` with useOr=true.
+    #[test]
     fn renders_not_in_for_integer_array_with_or() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual(
@@ -67,7 +102,7 @@ mod deparse_qual_unit_tests {
     }
 
     // Non-`=`/`<>` array operators (e.g. `>`) — keep parenthesised OR list.
-    #[pgrx::pg_test]
+    #[test]
     fn renders_parenthesised_or_for_other_operators() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual(
@@ -80,21 +115,21 @@ mod deparse_qual_unit_tests {
     }
 
     // Scalar fall-through: delegates to framework deparse, no precedence risk.
-    #[pgrx::pg_test]
+    #[test]
     fn renders_scalar_equality() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual("codi_emp", "=", Value::Cell(Cell::I32(51800)), false);
         assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "codi_emp = 51800");
     }
 
-    #[pgrx::pg_test]
+    #[test]
     fn renders_boolean_is_null_replacement() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual("active", "is", Value::Cell(Cell::Bool(true)), false);
         assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "active = 1");
     }
 
-    #[pgrx::pg_test]
+    #[test]
     fn renders_boolean_is_not() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual("active", "is not", Value::Cell(Cell::Bool(false)), false);

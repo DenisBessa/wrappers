@@ -229,19 +229,25 @@ pub(super) fn deparse_qual_to_sybase(qual: &Qual, fmt: &mut SybaseCellFormatter)
         }
     }
 
-    if qual.use_or
-        && let Value::Array(cells) = &qual.value
-    {
+    if let Value::Array(cells) = &qual.value {
         let values: Vec<String> = cells.iter().map(|c| fmt.fmt_cell(c)).collect();
-        return match oper {
-            "=" => format!("{} IN ({})", qual.field, values.join(", ")),
-            "<>" => format!("{} NOT IN ({})", qual.field, values.join(", ")),
-            _ => {
+        // PG emits `IN (...)` as `=` with useOr=true (ANY) and `NOT IN (...)`
+        // as `<>` with useOr=false (ALL). Both collapse to the canonical SQL
+        // form on the remote — equivalent semantics, index-friendly, and they
+        // sidestep the framework's deparse_with_fmt which panics on
+        // Value::Array with useOr=false (interface.rs:589).
+        return match (oper, qual.use_or) {
+            ("=", true) => format!("{} IN ({})", qual.field, values.join(", ")),
+            ("<>", false) | ("<>", true) => {
+                format!("{} NOT IN ({})", qual.field, values.join(", "))
+            }
+            (_, use_or) => {
+                let joiner = if use_or { " OR " } else { " AND " };
                 let conds: Vec<String> = cells
                     .iter()
                     .map(|c| format!("{} {} {}", qual.field, oper, fmt.fmt_cell(c)))
                     .collect();
-                format!("({})", conds.join(" OR "))
+                format!("({})", conds.join(joiner))
             }
         };
     }
