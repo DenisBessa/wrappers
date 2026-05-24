@@ -360,13 +360,12 @@ pub(crate) struct SybaseFdw {
     // connection overhead on correlated subqueries.
     cached_conn: Option<Connection<'static>>,
 
-    // Aggregate pushdown is on by default to bound memory for SUM/GROUP BY
-    // queries against large tables (without it, every matching row is buffered
-    // in `scan_result` and Postgres OOMs — see the `efentradaspag` CTE that
-    // killed the prod backend repeatedly on 2026-05-24). The escape hatch
-    // `aggregate_pushdown=false` on the SERVER turns it back off; it exists
-    // because PG built under Rosetta-emulated x86 has been observed allocating
-    // ~90 TB during upper-rel planning when this is enabled.
+    // Aggregate pushdown is opt-in via server option `aggregate_pushdown=true`.
+    // The deparse and execution paths are exercised by unit tests, but the
+    // planner integration has shown allocation issues under some PG versions
+    // (Rosetta-emulated x86 hits a >90 TB phantom allocation during upper-rel
+    // planning). Gating keeps the existing scan behavior unchanged for
+    // anyone who hasn't explicitly opted in.
     aggregate_pushdown_enabled: bool,
 }
 
@@ -706,8 +705,8 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
         let aggregate_pushdown_enabled = server
             .options
             .get("aggregate_pushdown")
-            .map(|v| !(v.eq_ignore_ascii_case("false") || v == "0"))
-            .unwrap_or(true);
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
 
         Ok(SybaseFdw {
             conn_str,
