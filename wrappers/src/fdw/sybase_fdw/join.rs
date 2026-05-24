@@ -187,6 +187,22 @@ unsafe extern "C-unwind" fn sybase_get_foreign_join_paths(
             _ => return,
         };
 
+        // Extract per-rel baserestrict quals. For join pushdown, PG passes
+        // empty `scan_clauses` to GetForeignPlan, so the FDW is fully
+        // responsible for applying every condition the base scans would have
+        // handled. If any qual isn't deparseable, abort the pushdown — the
+        // planner will fall back to per-table scans where baserestrictinfo
+        // is honored by the framework. Doing partial pushdown would silently
+        // widen the result.
+        let outer_baserel_conds = match extract_baserel_conditions(root, outerrel, outerrel, innerrel) {
+            Some(c) => c,
+            None => return,
+        };
+        let inner_baserel_conds = match extract_baserel_conditions(root, innerrel, outerrel, innerrel) {
+            Some(c) => c,
+            None => return,
+        };
+
         // Extract relation info
         let outer_info = match extract_rel_info(root, outerrel, "t_o") {
             Some(i) => i,
@@ -217,6 +233,8 @@ unsafe extern "C-unwind" fn sybase_get_foreign_join_paths(
             jointype,
             &target_columns,
             &join_conditions,
+            &outer_baserel_conds,
+            &inner_baserel_conds,
         );
 
         // Get connection string from the server
@@ -419,6 +437,61 @@ unsafe fn extract_join_conditions(
     }
 }
 
+/// Extract and deparse baserestrictinfo from a single rel, aliasing Vars via
+/// outerrel/innerrel membership the same way join conditions do.
+///
+/// Returns `None` on first non-pushable qual. Callers should treat that as a
+/// signal to abort join pushdown — for joinrels, PG passes empty `scan_clauses`
+/// to `GetForeignPlan`, so any baserestrict we don't push remotely is silently
+/// dropped from the executed plan. Aborting forces a fall-back to base-rel
+/// scans where the framework honors baserestrictinfo correctly.
+unsafe fn extract_baserel_conditions(
+    root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+    outerrel: *mut pg_sys::RelOptInfo,
+    innerrel: *mut pg_sys::RelOptInfo,
+) -> Option<Vec<String>> {
+    unsafe {
+        let baserestrictinfo = (*rel).baserestrictinfo;
+        if baserestrictinfo.is_null() {
+            return Some(Vec::new());
+        }
+
+        let mut conditions = Vec::new();
+
+        pgrx::memcx::current_context(|mcx| {
+            let list = List::<*mut c_void>::downcast_ptr_in_memcx(baserestrictinfo, mcx)?;
+
+            for item in list.iter() {
+                let rinfo = *item as *mut pg_sys::RestrictInfo;
+                if rinfo.is_null() {
+                    return None;
+                }
+                let clause = (*rinfo).clause as *mut pg_sys::Node;
+                if clause.is_null() {
+                    return None;
+                }
+
+                let node_tag = (*clause).type_;
+                if node_tag == pg_sys::NodeTag::T_OpExpr {
+                    let op_expr = clause as *mut pg_sys::OpExpr;
+                    match deparse_op_expr(root, op_expr, outerrel, innerrel) {
+                        Some(s) => conditions.push(s),
+                        None => return None,
+                    }
+                } else {
+                    // Not a binary OpExpr — bail.
+                    return None;
+                }
+            }
+
+            Some(())
+        })?;
+
+        Some(conditions)
+    }
+}
+
 /// Deparse a single OpExpr as a join condition.
 unsafe fn deparse_op_expr(
     root: *mut pg_sys::PlannerInfo,
@@ -602,6 +675,8 @@ fn deparse_join_sql(
     jointype: pg_sys::JoinType::Type,
     target_columns: &[JoinTargetColumn],
     join_conditions: &[String],
+    outer_baserel_conds: &[String],
+    inner_baserel_conds: &[String],
 ) -> String {
     let join_keyword = match jointype {
         pg_sys::JoinType::JOIN_INNER => "INNER JOIN",
@@ -610,20 +685,51 @@ fn deparse_join_sql(
         _ => "INNER JOIN",
     };
 
+    // Route per-rel baserestrict to ON vs WHERE based on join semantics:
+    // - INNER JOIN: both sides safe in WHERE.
+    // - LEFT JOIN: outer (preserved) side → WHERE. Inner (nullable) side →
+    //   ON, otherwise the predicate filters out NULL-extended rows and we
+    //   degenerate into INNER.
+    // - RIGHT JOIN: mirrors LEFT.
+    let mut on_extra: Vec<&str> = Vec::new();
+    let mut where_conds: Vec<&str> = Vec::new();
+    match jointype {
+        pg_sys::JoinType::JOIN_LEFT => {
+            on_extra.extend(inner_baserel_conds.iter().map(String::as_str));
+            where_conds.extend(outer_baserel_conds.iter().map(String::as_str));
+        }
+        pg_sys::JoinType::JOIN_RIGHT => {
+            on_extra.extend(outer_baserel_conds.iter().map(String::as_str));
+            where_conds.extend(inner_baserel_conds.iter().map(String::as_str));
+        }
+        _ => {
+            where_conds.extend(outer_baserel_conds.iter().map(String::as_str));
+            where_conds.extend(inner_baserel_conds.iter().map(String::as_str));
+        }
+    }
+
     let select_list = target_columns
         .iter()
         .map(|tc| tc.sql_expr.clone())
         .collect::<Vec<_>>()
         .join(", ");
 
-    let on_clause = if join_conditions.is_empty() {
+    let mut on_parts: Vec<&str> = join_conditions.iter().map(String::as_str).collect();
+    on_parts.extend(on_extra);
+    let on_clause = if on_parts.is_empty() {
         "1=1".to_string()
     } else {
-        join_conditions.join(" AND ")
+        on_parts.join(" AND ")
+    };
+
+    let where_clause = if where_conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_conds.join(" AND "))
     };
 
     format!(
-        "SELECT {select_list} FROM {} AS {} {join_keyword} {} AS {} ON {on_clause}",
+        "SELECT {select_list} FROM {} AS {} {join_keyword} {} AS {} ON {on_clause}{where_clause}",
         outer_info.table_name, outer_info.alias, inner_info.table_name, inner_info.alias,
     )
 }
