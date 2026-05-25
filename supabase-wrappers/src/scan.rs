@@ -325,47 +325,20 @@ pub(super) extern "C-unwind" fn get_foreign_paths<
                 }
             })
             .unwrap_or(0.0);
-        let total_cost = startup_cost + (*baserel).rows;
-
-        // create a ForeignPath node and add it as the only possible path
-        let path = pg_sys::create_foreignscan_path(
-            root,
-            baserel,
-            ptr::null_mut(), // default pathtarget
-            (*baserel).rows,
-            #[cfg(feature = "pg18")]
-            0, // disabled_nodes
-            startup_cost,
-            total_cost,
-            ptr::null_mut(), // no pathkeys
-            ptr::null_mut(), // no outer rel either
-            ptr::null_mut(), // no extra plan
-            #[cfg(any(feature = "pg17", feature = "pg18"))]
-            ptr::null_mut(), // no restrict info
-            ptr::null_mut(), // no fdw_private data
-        );
-        pg_sys::add_path(baserel, &mut ((*path).path));
 
         // SYBASE FORK BEGIN: parameterized paths for nested-loop joins between
         // the Sybase FDW (or any FDW) and local/other-FDW relations. Not present
-        // in upstream supabase/wrappers — see plans/faz-um-plano-pra-clever-origami.md.
+        // in upstream supabase/wrappers.
+        //
         // Per-scan overhead for parameterized paths. This accounts for the
         // network roundtrip cost of each remote query execution. Without this,
         // the planner always prefers Nested Loop (cost ≈ ppi_rows per iteration)
         // over Hash Join (cost = total_rows), even when Nested Loop means N*M
         // network roundtrips for N outer rows × M lookup tables.
         //
-        // The default of 20000 is intentionally high. When the planner
-        // underestimates the number of outer rows (a common case with FDWs
-        // where statistics are imprecise), it sees:
-        //   NL cost  = est_outer_rows × (fdw_startup_cost + ppi_rows)
-        //   Hash cost = total_rows (one full scan)
-        //
-        // With est_outer_rows=1 (typical underestimate) and default=20000:
-        // - Tables < 20k rows: 20001 > total_rows → Hash/Merge Join chosen
-        //   (one roundtrip, e.g. 2-3s for 14k rows)
-        // - Tables > 20k rows: 20001 < total_rows → Nested Loop chosen
-        //   (parameterized scan, good when actual outer rows are low)
+        // The default of 20000 is intentionally high to make parametrized NL
+        // dominate non-parametrized NL when the outer is small. See the
+        // inflation block below for why we ALSO bump the non-param cost.
         //
         // Override per table: ALTER FOREIGN TABLE ... OPTIONS (ADD fdw_startup_cost '500');
         let fdw_startup_cost = state
@@ -379,10 +352,9 @@ pub(super) extern "C-unwind" fn get_foreign_paths<
             })
             .unwrap_or(20000.0);
 
-        // Create parameterized paths for this foreign scan.
-        // This allows the planner to use Nested Loop joins that pass
-        // join keys as parameters to the inner foreign scan, avoiding
-        // full table scans when joining with other tables.
+        // Collect ParamPathInfo for every join clause that could parametrize
+        // this base rel. We do this BEFORE adding the non-param path so we can
+        // decide its cost based on whether parametrized paths exist.
         //
         // Equality join clauses (e.g., a.id = b.id) are absorbed into
         // equivalence classes (root->eq_classes), NOT stored in joininfo.
@@ -490,6 +462,56 @@ pub(super) extern "C-unwind" fn get_foreign_paths<
                 }
             });
         }
+
+        // Decide the non-parametrized total cost.
+        //
+        // Background: PG's NL cost at outer=1 is `inner.total`. Hash Join cost
+        // at outer=1 is `inner.total + outer.total + hash_overhead (~18)`. So
+        // PG ~always picks NL non-param over Hash Join when outer is
+        // underestimated (very common with materialized CTEs, scalar
+        // subqueries, and other constructs PG can't see through).
+        //
+        // The danger: NL non-param re-executes the full inner FT scan once
+        // per outer row at runtime. When the outer estimate of 1 is actually
+        // 500+ rows (e.g., the prod `getClientes` case where a `codi_emp = X`
+        // filter on a CTE Scan collapses the HashAggregate's 200 → 1 via
+        // default eq selectivity 0.005), the FT is rescanned 500+ times,
+        // transferring millions of ODBC rows and OOM-killing the backend.
+        //
+        // Fix: when this rel has any parametrizable join clause, inflate the
+        // non-param total_cost to at least `fdw_startup_cost * 2`. That makes
+        // the parametrized path (cost ≈ fdw_startup_cost + ppi_rows) win at
+        // outer=1, so PG picks NL param. Per-execution it sends a single
+        // `WHERE join_key = $X` to the remote — bounded transfer regardless
+        // of how badly the outer was underestimated.
+        //
+        // We keep `(*baserel).rows` untouched so cardinality estimates
+        // upstream (sort, agg, limit) stay accurate.
+        let base_total_cost = startup_cost + (*baserel).rows;
+        let total_cost = if seen_ppis.is_empty() {
+            base_total_cost
+        } else {
+            base_total_cost.max(fdw_startup_cost * 2.0)
+        };
+
+        // create a ForeignPath node and add it as the only possible path
+        let path = pg_sys::create_foreignscan_path(
+            root,
+            baserel,
+            ptr::null_mut(), // default pathtarget
+            (*baserel).rows,
+            #[cfg(feature = "pg18")]
+            0, // disabled_nodes
+            startup_cost,
+            total_cost,
+            ptr::null_mut(), // no pathkeys
+            ptr::null_mut(), // no outer rel either
+            ptr::null_mut(), // no extra plan
+            #[cfg(any(feature = "pg17", feature = "pg18"))]
+            ptr::null_mut(), // no restrict info
+            ptr::null_mut(), // no fdw_private data
+        );
+        pg_sys::add_path(baserel, &mut ((*path).path));
 
         // Create a parameterized foreign scan path for each unique parameterization
         for ppi in seen_ppis {
