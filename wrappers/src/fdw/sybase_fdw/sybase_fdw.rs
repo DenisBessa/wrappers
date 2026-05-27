@@ -935,8 +935,19 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
         _limit: &Option<Limit>,
         options: &HashMap<String, String>,
     ) -> SybaseFdwResult<(i64, i32)> {
-        // Allow explicit override via table option
-        if let Some(rows) = options.get("rows").and_then(|s| s.parse::<i64>().ok()) {
+        // Allow explicit override via table option. A value <= 0 is treated
+        // as "stale stats" — common when an automated job sets `rows` from
+        // sys.systable.count and the engine hasn't refreshed yet (and
+        // **always** the case for VIEWs, whose count column is 0). Honoring
+        // 0 as literal-zero collapses the FT to 1 estimated row via
+        // apply_quals_selectivity, which then poisons join cardinalities and
+        // forces NestedLoop with parameterized inner FTs (5+ minutes of ODBC
+        // round-trips per outer-row in prod for the getPayrollData /
+        // getPayrollSummary patterns). Fall through to the catalog query
+        // path, which handles views via `view_estimated_rows`.
+        if let Some(rows) = options.get("rows").and_then(|s| s.parse::<i64>().ok())
+            && rows > 0
+        {
             let width = if columns.is_empty() {
                 100
             } else {
