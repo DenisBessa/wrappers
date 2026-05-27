@@ -262,6 +262,9 @@ impl IntoDatum for Cell {
             || other == pg_sys::INT8OID
             || other == pg_sys::NUMERICOID
             || other == pg_sys::TEXTOID
+            || other == pg_sys::VARCHAROID
+            || other == pg_sys::BPCHAROID
+            || other == pg_sys::NAMEOID
             || other == pg_sys::DATEOID
             || other == pg_sys::TIMEOID
             || other == pg_sys::TIMESTAMPOID
@@ -277,6 +280,7 @@ impl IntoDatum for Cell {
             || other == pg_sys::FLOAT4ARRAYOID
             || other == pg_sys::FLOAT8ARRAYOID
             || other == pg_sys::TEXTARRAYOID
+            || other == pg_sys::VARCHARARRAYOID
     }
 }
 
@@ -312,7 +316,16 @@ impl FromDatum for Cell {
                 PgOid::BuiltIn(PgBuiltInOids::NUMERICOID) => {
                     AnyNumeric::from_datum(datum, is_null).map(Cell::Numeric)
                 }
-                PgOid::BuiltIn(PgBuiltInOids::TEXTOID) => {
+                PgOid::BuiltIn(PgBuiltInOids::TEXTOID)
+                | PgOid::BuiltIn(PgBuiltInOids::VARCHAROID)
+                | PgOid::BuiltIn(PgBuiltInOids::BPCHAROID)
+                | PgOid::BuiltIn(PgBuiltInOids::NAMEOID) => {
+                    // VARCHAR/BPCHAR/NAME share the same in-memory representation
+                    // as TEXT (varlena). Without this branch, a parametrized
+                    // join inner whose param type is VARCHAR (e.g. `customers_tax_numbers.tax_number`)
+                    // produces qual.value = Cell::I64(0) placeholder, deparsed to
+                    // `field = 0` — silently wrong rows. NAMEOID covers
+                    // catalog-introspection joins that flow into FT scans.
                     String::from_datum(datum, is_null).map(Cell::String)
                 }
                 PgOid::BuiltIn(PgBuiltInOids::DATEOID) => {
@@ -361,7 +374,8 @@ impl FromDatum for Cell {
                 PgOid::BuiltIn(PgBuiltInOids::FLOAT8ARRAYOID) => {
                     Vec::<Option<f64>>::from_datum(datum, false).map(Cell::F64Array)
                 }
-                PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID) => {
+                PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID)
+                | PgOid::BuiltIn(PgBuiltInOids::VARCHARARRAYOID) => {
                     Vec::<Option<String>>::from_datum(datum, false).map(Cell::StringArray)
                 }
                 PgOid::Custom(_) => {
