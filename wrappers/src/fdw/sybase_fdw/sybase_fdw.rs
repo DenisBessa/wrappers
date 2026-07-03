@@ -1035,7 +1035,7 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
                         }
                     }
                     Err(e) => {
-                        pgrx::notice!("get_rel_size: connection error for {}: {:?}", table, e);
+                        pgrx::debug1!("get_rel_size: connection error for {}: {:?}", table, e);
                         1000
                     }
                 }
@@ -1046,7 +1046,7 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
             1000
         };
         let elapsed = start.elapsed();
-        pgrx::notice!(
+        pgrx::debug1!(
             "get_rel_size: table={}, rows={}, elapsed={:.3}s",
             table,
             rows,
