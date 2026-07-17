@@ -232,6 +232,112 @@ CREATE FOREIGN TABLE dominio.fomovto_slow (
   OPTIONS (table 'bethadba.fomovto', view_estimated_rows '1000000');
 
 -- ============================================================================
+-- FOREIGN TABLES adicionais para as 12 famílias de queries de prod (Temp.sql).
+-- Espelham bethadba.* de 03_prod_query_tables.sql.
+-- ============================================================================
+
+-- #1 saldo contábil histórico
+DROP FOREIGN TABLE IF EXISTS dominio.ctvlancto CASCADE;
+CREATE FOREIGN TABLE dominio.ctvlancto (
+    codi_emp        integer NOT NULL,
+    codi_cta        integer NOT NULL,
+    codi_emp_plano  integer NOT NULL,
+    tipo_cta        text    NOT NULL,
+    vlor_lan        numeric(15,2) NOT NULL,
+    data_lan        date    NOT NULL,
+    i_lancto        integer NOT NULL
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.ctvlancto');
+
+-- #2 / #7 saldos de imposto
+DROP FOREIGN TABLE IF EXISTS dominio.efsdoimp CASCADE;
+CREATE FOREIGN TABLE dominio.efsdoimp (
+    codi_emp    integer NOT NULL,
+    codi_imp    integer NOT NULL,
+    data_sim    date    NOT NULL,
+    sdev_sim    numeric(15,2)
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.efsdoimp');
+
+DROP FOREIGN TABLE IF EXISTS dominio.efsdoimp_por_recolhimento CASCADE;
+CREATE FOREIGN TABLE dominio.efsdoimp_por_recolhimento (
+    codi_emp             integer NOT NULL,
+    codi_imp             integer NOT NULL,
+    codigo_recolhimento  text    NOT NULL,
+    data_sim             date    NOT NULL,
+    saldo_recolher       numeric(15,2)
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.efsdoimp_por_recolhimento');
+
+-- #7 vigência de parâmetros
+DROP FOREIGN TABLE IF EXISTS dominio.efparametro_vigencia CASCADE;
+CREATE FOREIGN TABLE dominio.efparametro_vigencia (
+    codi_emp     integer NOT NULL,
+    vigencia_par date    NOT NULL,
+    par_valor    numeric(15,2)
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.efparametro_vigencia');
+
+-- #6 cadastro de impostos e vigências
+DROP FOREIGN TABLE IF EXISTS dominio.geimposto CASCADE;
+CREATE FOREIGN TABLE dominio.geimposto (
+    codi_emp  integer NOT NULL,
+    codi_imp  integer NOT NULL,
+    nome_imp  text
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.geimposto');
+
+DROP FOREIGN TABLE IF EXISTS dominio.geimposto_vigencia CASCADE;
+CREATE FOREIGN TABLE dominio.geimposto_vigencia (
+    codi_emp     integer NOT NULL,
+    codi_imp     integer NOT NULL,
+    vigencia_imp date    NOT NULL,
+    cdrn_imp     text,
+    lanc_imp     text
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.geimposto_vigencia');
+
+-- #11 provisões
+DROP FOREIGN TABLE IF EXISTS dominio.foprovisoes CASCADE;
+CREATE FOREIGN TABLE dominio.foprovisoes (
+    codi_emp     integer NOT NULL,
+    i_empregados integer NOT NULL,
+    competencia  date    NOT NULL,
+    tipo         smallint NOT NULL,
+    avos         numeric(5,2),
+    salario      numeric(15,2)
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.foprovisoes');
+
+DROP FOREIGN TABLE IF EXISTS dominio.foprovisoes_valores CASCADE;
+CREATE FOREIGN TABLE dominio.foprovisoes_valores (
+    codi_emp                integer NOT NULL,
+    i_empregados            integer NOT NULL,
+    competencia             date    NOT NULL,
+    tipo                    smallint NOT NULL,
+    tipo_valor              smallint NOT NULL,
+    valor_adicional_ferias  numeric(15,2),
+    valor_fgts              numeric(15,2),
+    valor_inss_empresa      numeric(15,2),
+    valor_inss_rat          numeric(15,2),
+    valor_inss_terceiros    numeric(15,2),
+    valor_medias_vantagens  numeric(15,2),
+    valor_pis               numeric(15,2),
+    valor                   numeric(15,2)
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.foprovisoes_valores');
+
+-- #12 alterações contratuais
+DROP FOREIGN TABLE IF EXISTS dominio.foempregados_alteracao_contratual CASCADE;
+CREATE FOREIGN TABLE dominio.foempregados_alteracao_contratual (
+    codi_emp       integer NOT NULL,
+    i_empregados   integer NOT NULL,
+    data_alteracao date    NOT NULL,
+    salario        numeric(15,2)
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.foempregados_alteracao_contratual');
+
+-- ============================================================================
 -- MATERIALIZED VIEWS (sem sufixo) — cache local do que está no Sybase.
 -- IMPORTANTE: em produção `dominio.efsaidas` é DIRETAMENTE a FT (sem MV
 -- intermediário). É a topologia que dispara o bug #2.

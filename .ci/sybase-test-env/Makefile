@@ -21,7 +21,7 @@ PSQL := $(PG) psql -h localhost -U postgres -X -v ON_ERROR_STOP=1
 help:
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*##/:	/'
 
-bootstrap: setup-sa-volume up setup-pg ## Setup completo desde zero.
+bootstrap: setup-sa-volume up setup-sa-extra setup-pg ## Setup completo desde zero.
 	@echo
 	@echo "==> Ambiente pronto. Rode 'make test' para validar."
 
@@ -52,6 +52,17 @@ setup-sa:
 	  echo '--- $$f ---'; \
 	  dbisql -onerror exit -c 'UID=externo;PWD=externo123;HOST=localhost:2638;DBN=bethadba;ENG=bethadba' -nogui /tmp/$$f.sql || \
 	    { [ $$f = 00_users ] && echo '(users já existem, ok)' || exit 1; }; \
+	done"
+
+# Aplica tabelas/dados EXTRAS (03/04) das 12 famílias de queries de prod.
+# Idempotente (DROP TABLE IF EXISTS). Roda depois que o volume base já existe.
+setup-sa-extra: ## Aplica 03_prod_query_tables.sql + 04_prod_query_data.sql no Sybase.
+	@echo "==> Aplicando schema/dados extras (prod queries) no Sybase..."
+	@docker cp sql/03_prod_query_tables.sql sybase-fdw-test-sybase:/tmp/03_prod_query_tables.sql
+	@docker cp sql/04_prod_query_data.sql sybase-fdw-test-sybase:/tmp/04_prod_query_data.sql
+	@$(SA) sh -c "for f in 03_prod_query_tables 04_prod_query_data; do \
+	  echo '--- $$f ---'; \
+	  dbisql -onerror exit -c 'UID=externo;PWD=externo123;HOST=localhost:2638;DBN=bethadba;ENG=bethadba' -nogui /tmp/$$f.sql || exit 1; \
 	done"
 
 setup-pg: ## Aplica setup-pg.sql (extension + FT + locals).
