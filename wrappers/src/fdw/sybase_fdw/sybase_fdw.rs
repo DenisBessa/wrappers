@@ -15,6 +15,8 @@ use super::{SybaseFdwError, SybaseFdwResult};
 pub(super) static ODBC_ENV: LazyLock<Environment> =
     LazyLock::new(|| Environment::new().expect("Failed to create ODBC environment"));
 
+const LOGIN_TIMEOUT_SEC: u32 = 10;
+
 /// Open an ODBC connection with READ UNCOMMITTED isolation level.
 ///
 /// Sybase SQL Anywhere uses read locks by default, which causes blocking
@@ -26,7 +28,11 @@ pub(super) static ODBC_ENV: LazyLock<Environment> =
 /// risk of dirty reads is negligible compared to the benefit of avoiding
 /// deadlocks and lock waits.
 pub(super) fn connect_unlocked(conn_str: &str) -> Result<Connection<'static>, odbc_api::Error> {
-    let conn = ODBC_ENV.connect_with_connection_string(conn_str, ConnectionOptions::default())?;
+    let options = ConnectionOptions {
+        login_timeout_sec: Some(LOGIN_TIMEOUT_SEC),
+        ..ConnectionOptions::default()
+    };
+    let conn = ODBC_ENV.connect_with_connection_string(conn_str, options)?;
     // SET TEMPORARY OPTION scopes to this connection only, no side effects
     conn.execute("SET TEMPORARY OPTION isolation_level = 0", ())?;
     Ok(conn)
