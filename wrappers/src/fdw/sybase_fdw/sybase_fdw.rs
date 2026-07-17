@@ -242,6 +242,23 @@ pub(super) fn deparse_qual_to_sybase(qual: &Qual, fmt: &mut SybaseCellFormatter)
         }
     }
 
+    // ILIKE / NOT ILIKE — Postgres operators `~~*` / `!~~*`. Sybase SQL Anywhere
+    // has no such operator and rejects it at parse time (SQL Anywhere Error -131:
+    // "Syntax error near '~'"), so a pushed-down ILIKE on a foreign column would
+    // fail the whole scan. The framework only maps `~~`/`!~~` to LIKE/NOT LIKE;
+    // translate the case-insensitive variants to a collation-independent
+    // UPPER(col) LIKE UPPER(pattern). (`~~`/`!~~` fall through to the framework,
+    // which renders them as LIKE/NOT LIKE unchanged.)
+    if let Value::Cell(cell) = &qual.value {
+        match oper {
+            "~~*" => return format!("UPPER({}) LIKE UPPER({})", qual.field, fmt.fmt_cell(cell)),
+            "!~~*" => {
+                return format!("UPPER({}) NOT LIKE UPPER({})", qual.field, fmt.fmt_cell(cell));
+            }
+            _ => {}
+        }
+    }
+
     if let Value::Array(cells) = &qual.value {
         let values: Vec<String> = cells.iter().map(|c| fmt.fmt_cell(c)).collect();
         // PG emits `IN (...)` as `=` with useOr=true (ANY) and `NOT IN (...)`

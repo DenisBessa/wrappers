@@ -135,6 +135,41 @@ mod deparse_qual_unit_tests {
         let q = qual("active", "is not", Value::Cell(Cell::Bool(false)), false);
         assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "active <> 0");
     }
+
+    // ILIKE (`~~*`) — Sybase has no such operator; the framework only maps
+    // `~~`→LIKE. Without translation the FDW emits `~~*` verbatim and Sybase
+    // rejects it ("Syntax error near '~'"), failing any query that pushes an
+    // ILIKE on a foreign column. Translate to a collation-independent
+    // UPPER()/UPPER() case-insensitive match.
+    #[test]
+    fn renders_ilike_as_upper_like() {
+        let mut fmt = SybaseCellFormatter {};
+        let q = qual(
+            "cname",
+            "~~*",
+            Value::Cell(Cell::String("%saldo%".to_string())),
+            false,
+        );
+        assert_eq!(
+            deparse_qual_to_sybase(&q, &mut fmt),
+            "UPPER(cname) LIKE UPPER('%saldo%')"
+        );
+    }
+
+    #[test]
+    fn renders_not_ilike_as_upper_not_like() {
+        let mut fmt = SybaseCellFormatter {};
+        let q = qual(
+            "cname",
+            "!~~*",
+            Value::Cell(Cell::String("%tmp%".to_string())),
+            false,
+        );
+        assert_eq!(
+            deparse_qual_to_sybase(&q, &mut fmt),
+            "UPPER(cname) NOT LIKE UPPER('%tmp%')"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -326,8 +361,12 @@ mod deparse_aggregate_query_tests {
 // The 13 #[pgrx::pg_test] integration tests that used to live in this file
 // (sybase_basic_scan, sybase_full_vacation_query, sybase_payment_voucher_query,
 // etc.) were migrated to SQL fixtures under
-// `.ci/sybase-test-env/fixtures/11x_*.sql` and `12x_*.sql`. They run against
-// the Docker stack documented in `.ci/sybase-test-env/README.md` (`make test`),
+// `.ci/sybase-test-env/fixtures/11x_*.sql` and `12x_*.sql`. The `14x_*.sql`
+// fixtures reproduce the 12 problematic prod query families captured in
+// `Temp.sql` (saldo SUM(CASE), geimposto join, OFFSET-before-WHERE / ILIKE
+// pushdown, apurar-gate aggregate pushdown, efsaidas bulk quals, efsdoimp bulk,
+// foprovisoes N+1, alteracao-contratual multi-FT). They run against the Docker
+// stack documented in `.ci/sybase-test-env/README.md` (`make test`),
 // which spins up SQL Anywhere with a synthetic `bethadba` schema and exercises
 // each test path without needing the production Sybase server (the old
 // pg_tests required `SYBASE_HOST` env var and a live connection).
