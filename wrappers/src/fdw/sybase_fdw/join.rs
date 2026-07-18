@@ -194,14 +194,16 @@ unsafe extern "C-unwind" fn sybase_get_foreign_join_paths(
         // planner will fall back to per-table scans where baserestrictinfo
         // is honored by the framework. Doing partial pushdown would silently
         // widen the result.
-        let outer_baserel_conds = match extract_baserel_conditions(root, outerrel, outerrel, innerrel) {
-            Some(c) => c,
-            None => return,
-        };
-        let inner_baserel_conds = match extract_baserel_conditions(root, innerrel, outerrel, innerrel) {
-            Some(c) => c,
-            None => return,
-        };
+        let outer_baserel_conds =
+            match extract_baserel_conditions(root, outerrel, outerrel, innerrel) {
+                Some(c) => c,
+                None => return,
+            };
+        let inner_baserel_conds =
+            match extract_baserel_conditions(root, innerrel, outerrel, innerrel) {
+                Some(c) => c,
+                None => return,
+            };
 
         // Extract relation info
         let outer_info = match extract_rel_info(root, outerrel, "t_o") {
@@ -1000,8 +1002,7 @@ unsafe extern "C-unwind" fn sybase_iterate_foreign_scan(
         // See sybase_begin_foreign_scan: scanrelid==0 alone doesn't prove this
         // is a join scan, so check the marker. Falling through to the original
         // callback handles aggregate-pushdown upper rels (also scanrelid==0).
-        let is_join = scanrelid == 0
-            && !deserialize_join_state((*plan).fdw_private as _).is_null();
+        let is_join = scanrelid == 0 && !deserialize_join_state((*plan).fdw_private as _).is_null();
         if !is_join {
             let orig = ORIGINAL_CALLBACKS.get().unwrap();
             return (orig.iterate_foreign_scan.unwrap())(node);
@@ -1057,8 +1058,7 @@ unsafe extern "C-unwind" fn sybase_re_scan_foreign_scan(node: *mut pg_sys::Forei
         let plan = (*node).ss.ps.plan as *mut pg_sys::ForeignScan;
         let scanrelid = (*plan).scan.scanrelid;
 
-        let is_join = scanrelid == 0
-            && !deserialize_join_state((*plan).fdw_private as _).is_null();
+        let is_join = scanrelid == 0 && !deserialize_join_state((*plan).fdw_private as _).is_null();
         if !is_join {
             let orig = ORIGINAL_CALLBACKS.get().unwrap();
             return (orig.re_scan_foreign_scan.unwrap())(node);
@@ -1082,8 +1082,7 @@ unsafe extern "C-unwind" fn sybase_explain_foreign_scan(
         let plan = (*node).ss.ps.plan as *mut pg_sys::ForeignScan;
         let scanrelid = (*plan).scan.scanrelid;
 
-        let is_join = scanrelid == 0
-            && !deserialize_join_state((*plan).fdw_private as _).is_null();
+        let is_join = scanrelid == 0 && !deserialize_join_state((*plan).fdw_private as _).is_null();
         if !is_join {
             // Base table scan or aggregate-pushdown upper rel: delegate to framework.
             if let Some(orig_fn) = ORIGINAL_CALLBACKS.get().unwrap().explain_foreign_scan {
@@ -1115,8 +1114,7 @@ unsafe extern "C-unwind" fn sybase_end_foreign_scan(node: *mut pg_sys::ForeignSc
         let plan = (*node).ss.ps.plan as *mut pg_sys::ForeignScan;
         let scanrelid = (*plan).scan.scanrelid;
 
-        let is_join = scanrelid == 0
-            && !deserialize_join_state((*plan).fdw_private as _).is_null();
+        let is_join = scanrelid == 0 && !deserialize_join_state((*plan).fdw_private as _).is_null();
         if !is_join {
             let orig = ORIGINAL_CALLBACKS.get().unwrap();
             return (orig.end_foreign_scan.unwrap())(node);

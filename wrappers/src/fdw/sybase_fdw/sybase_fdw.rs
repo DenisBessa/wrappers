@@ -259,7 +259,11 @@ pub(super) fn deparse_qual_to_sybase(qual: &Qual, fmt: &mut SybaseCellFormatter)
         match oper {
             "~~*" => return format!("UPPER({}) LIKE UPPER({})", qual.field, fmt.fmt_cell(cell)),
             "!~~*" => {
-                return format!("UPPER({}) NOT LIKE UPPER({})", qual.field, fmt.fmt_cell(cell));
+                return format!(
+                    "UPPER({}) NOT LIKE UPPER({})",
+                    qual.field,
+                    fmt.fmt_cell(cell)
+                );
             }
             _ => {}
         }
@@ -417,8 +421,7 @@ impl Drop for StreamingScan {
         // remaining batches before letting `block` drop. SQLCancel would be
         // cheaper but odbc-api 8 doesn't expose it.
         if !self.eof {
-            // SAFETY: `block` is still initialized at this point.
-            let block = unsafe { &mut *self.block };
+            let block = &mut *self.block;
             while let Ok(Some(_)) = block.fetch() {
                 // Discard the batch; we only need the cursor consumed.
             }
@@ -571,10 +574,11 @@ pub(crate) struct SybaseFdw {
     stored_sorts: Vec<Sort>,
     stored_limit: Option<Limit>,
 
-    // Cached ODBC connection, reused across scans to avoid connection
-    // overhead on correlated subqueries. `execute_query` `take()`s it to
-    // hand ownership to `StreamingScan`; `end_scan` recovers it via
-    // `StreamingScan::into_connection`.
+    // Cached ODBC connection, reused by rescans while an executor scan is
+    // active to avoid connection overhead on correlated subqueries.
+    // `execute_query` `take()`s it to hand ownership to `StreamingScan` and
+    // `close_stream` recovers it via `StreamingScan::into_connection`.
+    // `end_scan` must drop it because FdwState can outlive the executor scan.
     cached_conn: Option<Connection<'static>>,
 
     // Aggregate pushdown can be disabled per-server with `aggregate_pushdown=false`.
@@ -588,8 +592,6 @@ pub(crate) struct SybaseFdw {
 }
 
 impl SybaseFdw {
-    const FDW_NAME: &'static str = "SybaseFdw";
-
     // Map Sybase SQL Anywhere data types to PostgreSQL types
     fn map_sybase_type(sybase_type: &str) -> Option<&'static str> {
         let type_lower = sybase_type.to_lowercase();
@@ -857,7 +859,7 @@ impl SybaseFdw {
 
     /// Drop any in-progress stream. If the cursor was drained to EOF, the
     /// underlying connection is recycled into `cached_conn` for the next
-    /// scan; if not (e.g. PG stopped iterating early because of LIMIT or a
+    /// rescan; if not (e.g. PG stopped iterating early because of LIMIT or a
     /// JOIN early-exit), the connection is dropped — closing a FreeTDS
     /// cursor mid-stream leaves the wire protocol out of sync ("Bad token
     /// from the server: Datastream processing out of sync") on the next
@@ -1020,8 +1022,7 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
                         let sql = format!(
                             "SELECT t.count, t.table_type FROM sys.systable t \
                              JOIN sys.sysuser u ON t.creator = u.user_id \
-                             WHERE u.user_name = '{}' AND t.table_name = '{}'",
-                            schema, table_name
+                             WHERE u.user_name = '{schema}' AND t.table_name = '{table_name}'"
                         );
                         match conn.execute(&sql, ()) {
                             Ok(Some(mut cursor)) => {
@@ -1202,6 +1203,12 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
 
     fn end_scan(&mut self) -> SybaseFdwResult<()> {
         self.close_stream();
+
+        // FdwState follows the cached plan's lifetime and can survive until
+        // DEALLOCATE or session end.  An ODBC connection is a per-executor-
+        // scan resource and must not survive EndForeignScan with that state.
+        // Keep the cache only for rescans performed before this hook.
+        self.cached_conn = None;
         Ok(())
     }
 

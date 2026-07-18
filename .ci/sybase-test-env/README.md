@@ -40,6 +40,9 @@ A partir daí, o ciclo é:
 # Roda toda a suíte
 make test
 
+# Regressão de lifetime: 1 sessão, 150 tx, 5 SELECTs FDW por tx
+make test-connection-lifetime
+
 # Roda só um teste
 make test-bug2
 
@@ -68,7 +71,9 @@ make shell-sa     # dbisql no Sybase
 │   └── 02_data.sql              # popula com dados sintéticos
 ├── scripts/
 │   ├── setup-pg.sql             # CREATE EXTENSION/SERVER/FT no Postgres
-│   └── run-tests.sh             # runner de fixtures
+│   ├── run-tests.sh             # runner de fixtures
+│   ├── test-connection-lifetime.sh # pgbench persistente + amostragem de FDs
+│   └── pgbench-connection-lifetime.sql # 5 scans FDW vazios por transação
 ├── fixtures/
 │   ├── 000_smoke.sql            # FT funciona
 │   ├── 010_pushdown_indexed.sql # filtros PK pushdown
@@ -131,6 +136,14 @@ no nosso ambiente local aparece como SIGSEGV. A fixture `bug2b` executa
 `PREPARE ... AS ... ; EXECUTE × 7` e é a regressão direta dos dois bugs —
 antes do fix em `supabase-wrappers/src/scan.rs` e `qual.rs`, ela crasha; depois,
 todos os 7 executes retornam dados.
+
+**Por que existe `test-connection-lifetime.sh`?** O `FdwState` precisa viver
+até o plano ser desalocado para proteger generic plans, mas recursos de cada
+scan não podem herdar esse lifetime. O teste mantém uma única conexão
+PostgreSQL em protocolo simples por 150 transações, executando cinco SELECTs
+FDW vazios em cada uma. Além de exigir exit code zero, ele amostra os FDs do
+backend e falha acima de 128. Isso torna a regressão determinística no ambiente
+local, cujo `nofile` é maior que o limite 1.024 observado em produção.
 
 **Por que `log_statement = 'all'` e `log_min_duration_statement = 0`?** Para
 capturar o SQL do statement que crashou no log do container — sem isso o

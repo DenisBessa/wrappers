@@ -250,16 +250,15 @@ pub(crate) unsafe fn extract_from_op_expr(
                         // via PARAM_EXEC. Required by sybase_now_pushdown test and
                         // production queries with `data_inicio < NOW()`. Not present
                         // in upstream supabase/wrappers.
-                        } else if !pg_sys::contain_var_clause(right as *mut pg_sys::Node) {
+                        } else if !pg_sys::contain_var_clause(right) {
                             // Handle evaluable expressions without variable references
                             // (e.g., NOW(), CURRENT_DATE, arithmetic on constants).
                             // These will be evaluated at execution time via PARAM_EXEC path.
                             // Deep-copy the expression so its lifetime matches state.tmp_ctx
                             // (see Param T_Param branch above for rationale).
-                            let type_oid = pg_sys::exprType(right as *mut pg_sys::Node);
-                            let expr_copy = pg_sys::copyObjectImpl(
-                                right as *const std::ffi::c_void,
-                            ) as *mut pg_sys::Expr;
+                            let type_oid = pg_sys::exprType(right);
+                            let expr_copy = pg_sys::copyObjectImpl(right as *const std::ffi::c_void)
+                                as *mut pg_sys::Expr;
                             let param = Param {
                                 kind: pg_sys::ParamKind::PARAM_EXEC,
                                 id: 0,

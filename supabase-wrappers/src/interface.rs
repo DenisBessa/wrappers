@@ -583,9 +583,7 @@ impl Qual {
                 let joiner = if self.use_or { " or " } else { " and " };
                 let conds: Vec<String> = cells
                     .iter()
-                    .map(|cell| {
-                        format!("{} {} {}", self.field, self.operator, t.fmt_cell(cell))
-                    })
+                    .map(|cell| format!("{} {} {}", self.field, self.operator, t.fmt_cell(cell)))
                     .collect();
                 conds.join(joiner)
             }

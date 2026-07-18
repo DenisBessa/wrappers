@@ -15,7 +15,7 @@ PG := docker exec -i sybase-fdw-test-postgres
 SA := docker exec -i sybase-fdw-test-sybase
 PSQL := $(PG) psql -h localhost -U postgres -X -v ON_ERROR_STOP=1
 
-.PHONY: help bootstrap setup-sa setup-pg up down restart test test-bug1 test-bug2 \
+.PHONY: help bootstrap setup-sa setup-pg up down restart test test-connection-lifetime test-bug1 test-bug2 \
         rebuild shell-pg shell-sa logs logs-pg logs-sa clean ps
 
 help:
@@ -84,8 +84,12 @@ down: ## Para containers (mantém volumes).
 
 restart: down up ## Reinicia.
 
-test: ## Roda todos os testes em fixtures/.
+test: ## Roda as fixtures SQL e a regressão persistente de conexões/FDs.
 	@./scripts/run-tests.sh
+	@./scripts/test-connection-lifetime.sh
+
+test-connection-lifetime: ## Valida 1 sessão × 150 tx × 5 SELECTs e FDs limitados.
+	@./scripts/test-connection-lifetime.sh
 
 test-bug1: ## Roda repro do bug #1 (SIGSEGV).
 	@./scripts/run-tests.sh fixtures/bug1_segfault_correlated_subq.sql

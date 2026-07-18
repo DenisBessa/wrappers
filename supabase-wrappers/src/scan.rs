@@ -229,10 +229,9 @@ unsafe fn register_fdw_state_cleanup<E: Into<ErrorReport>, W: ForeignDataWrapper
         // Allocate the callback struct in the same context we're watching so
         // it goes away with the context. `MemoryContextAlloc` raises an ERROR
         // on OOM instead of returning null, so no further null check is needed.
-        let cb = pg_sys::MemoryContextAlloc(
-            ctx,
-            std::mem::size_of::<pg_sys::MemoryContextCallback>(),
-        ) as *mut pg_sys::MemoryContextCallback;
+        let cb =
+            pg_sys::MemoryContextAlloc(ctx, std::mem::size_of::<pg_sys::MemoryContextCallback>())
+                as *mut pg_sys::MemoryContextCallback;
         std::ptr::write(
             cb,
             pg_sys::MemoryContextCallback {
@@ -652,15 +651,14 @@ pub(super) extern "C-unwind" fn get_foreign_plan<E: Into<ErrorReport>, W: Foreig
                             // (deep-copying Param nodes) land in our session-
                             // lived context rather than MessageContext, which
                             // PG resets between EXECUTEs of a prepared statement.
-                            let qual = PgMemoryContexts::For(tmp_ctx)
-                                .switch_to(|_| {
-                                    extract_from_op_expr(
-                                        root,
-                                        foreigntableid,
-                                        (*baserel).relids,
-                                        expr as _,
-                                    )
-                                });
+                            let qual = PgMemoryContexts::For(tmp_ctx).switch_to(|_| {
+                                extract_from_op_expr(
+                                    root,
+                                    foreigntableid,
+                                    (*baserel).relids,
+                                    expr as _,
+                                )
+                            });
                             if let Some(qual) = qual
                                 && qual.param.is_some()
                             {
@@ -995,9 +993,7 @@ pub(super) extern "C-unwind" fn begin_foreign_scan<
 
             pgrx::memcx::current_context(|mcx| {
                 if let Some(exprs) =
-                    pgrx::list::List::<*mut std::ffi::c_void>::downcast_ptr_in_memcx(
-                        fdw_exprs, mcx,
-                    )
+                    pgrx::list::List::<*mut std::ffi::c_void>::downcast_ptr_in_memcx(fdw_exprs, mcx)
                 {
                     for expr_ptr in exprs.iter() {
                         let expr = *expr_ptr as *mut pg_sys::Node;
@@ -1040,8 +1036,10 @@ pub(super) extern "C-unwind" fn begin_foreign_scan<
                 state.begin_scan()
             };
             if result.is_err() {
-                // Don't drop here — the memcontext callback owns the state
-                // lifetime now. Just propagate the error.
+                // Release per-scan resources before detaching the state. Do
+                // not drop FdwState itself: the memcontext callback owns its
+                // plan/session lifetime.
+                let _ = state.end_scan();
                 (*node).fdw_state = ptr::null::<FdwState<E, W>>() as _;
                 result.report_unwrap();
             }
@@ -1089,11 +1087,16 @@ pub(super) extern "C-unwind" fn iterate_foreign_scan<
 
         let result = state.iter_scan();
         if result.is_err() {
-            // Don't drop — memcontext callback owns lifetime.
+            // An executor error does not guarantee EndForeignScan will run.
+            // Clean up the active scan before the long-lived state is
+            // detached, but leave FdwState ownership with its callback.
+            let _ = state.end_scan();
             (*node).fdw_state = ptr::null::<FdwState<E, W>>() as _;
         }
         if result.report_unwrap().is_some() {
             if state.row.cols.len() != state.tgts.len() {
+                let _ = state.end_scan();
+                (*node).fdw_state = ptr::null::<FdwState<E, W>>() as _;
                 report_error(
                     PgSqlErrorCode::ERRCODE_FDW_INVALID_COLUMN_NUMBER,
                     "target column number not match",
@@ -1167,7 +1170,10 @@ pub(super) extern "C-unwind" fn re_scan_foreign_scan<
                 state.re_scan()
             };
             if result.is_err() {
-                // Don't drop — memcontext callback owns lifetime.
+                // EndForeignScan is not guaranteed after a rescan error, so
+                // release stream/connection resources before detaching the
+                // state without destroying the plan-owned FdwState.
+                let _ = state.end_scan();
                 (*node).fdw_state = ptr::null::<FdwState<E, W>>() as _;
                 result.report_unwrap();
             }
