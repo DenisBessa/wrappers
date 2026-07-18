@@ -94,6 +94,8 @@ jobs:
           cd wrappers && RUSTFLAGS="-D warnings" cargo clippy --all --tests --no-deps --features native_fdws,helloworld_fdw
 
       - name: Perform test
+        env:
+          RUSTFLAGS: "-D warnings -Clink-arg=-Wl,--unresolved-symbols=ignore-all"
         run: cd wrappers && cargo pgrx test --features "native_fdws pg15"
 
   # =============================================================
