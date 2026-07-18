@@ -64,6 +64,14 @@ jobs:
       - name: Build docker images
         run: |
           docker compose -f wrappers/.ci/docker-compose-native.yaml up -d
+          if ! S3_INIT_STATUS=$(timeout 180 docker wait s3-init); then
+            docker logs s3-init
+            exit 1
+          fi
+          if [[ "$S3_INIT_STATUS" != "0" ]]; then
+            docker logs s3-init
+            exit 1
+          fi
 
       - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
         with:
