@@ -52,6 +52,7 @@ jobs:
 
     steps:
       - name: Delete All Caches
+        if: github.repository_owner == 'supabase'
         uses: useblacksmith/cache-delete@v1
         with:
           key: ""
@@ -191,12 +192,13 @@ jobs:
       - name: Download and install latest released extension
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPOSITORY: ${{ github.repository_owner == 'supabase' && github.repository || 'supabase/wrappers' }}
         run: |
-          LATEST_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --json tagName --jq '[.[] | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | .[0].tagName')
+          LATEST_TAG=$(gh release list --repo "$RELEASE_REPOSITORY" --limit 50 --json tagName --jq '[.[] | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | .[0].tagName')
           echo "LATEST_TAG=${LATEST_TAG}" >> "$GITHUB_ENV"
           echo "OLD_VERSION=${LATEST_TAG#v}" >> "$GITHUB_ENV"
           gh release download "$LATEST_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
+            --repo "$RELEASE_REPOSITORY" \
             --pattern "wrappers-${LATEST_TAG}-pg15-amd64-linux-gnu.deb" \
             --dir /tmp/wrappers-released
           sudo dpkg -i /tmp/wrappers-released/*.deb
