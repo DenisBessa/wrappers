@@ -104,6 +104,7 @@ jobs:
       - name: Perform test
         env:
           RUSTFLAGS: "-D warnings -Clink-arg=-Wl,--unresolved-symbols=ignore-all"
+          SKIP_ICEBERG_TEST: ${{ github.repository_owner != 'supabase' && '1' || '' }}
         run: cd wrappers && cargo pgrx test --features "native_fdws pg15"
 
   # =============================================================

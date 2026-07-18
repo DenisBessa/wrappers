@@ -69,6 +69,7 @@ jobs:
         id: coverage
         env:
           RUSTFLAGS: "-D warnings -Clink-arg=-Wl,--unresolved-symbols=ignore-all"
+          SKIP_ICEBERG_TEST: ${{ github.repository_owner != 'supabase' && '1' || '' }}
         run: |
           source <(cargo llvm-cov show-env --export-prefix --no-cfg-coverage)
           cargo llvm-cov clean --workspace
