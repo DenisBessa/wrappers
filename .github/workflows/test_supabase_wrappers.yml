@@ -19,7 +19,7 @@ permissions:
 jobs:
   test:
     name: Run supabase_wrappers tests
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository_owner == 'supabase' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
 
     steps:
       - name: Checkout code
