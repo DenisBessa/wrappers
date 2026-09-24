@@ -7,6 +7,13 @@ mod tests {
 
     #[pg_test]
     fn iceberg_smoketest() {
+        // The Docker REST fixture hangs on GitHub-hosted fork runners, while
+        // the upstream Blacksmith job exercises it normally. Fork CI opts out
+        // explicitly so an unrelated fixture cannot mask the native suite.
+        if option_env!("SKIP_ICEBERG_TEST") == Some("1") {
+            return;
+        }
+
         Spi::connect_mut(|c| {
             c.update(
                 r#"CREATE FOREIGN DATA WRAPPER iceberg_wrapper
@@ -21,6 +28,7 @@ mod tests {
                      OPTIONS (
                        aws_access_key_id 'admin',
                        aws_secret_access_key 'password',
+                       region_name 'us-east-1',
                        catalog_uri 'http://localhost:8181',
                        warehouse 'warehouse',
                        "s3.endpoint" 'http://localhost:8000'

@@ -22,7 +22,7 @@ permissions:
 jobs:
   code-coverage:
     name: Code Coverage
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository_owner == 'supabase' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -46,7 +46,7 @@ jobs:
           . /etc/os-release
           sudo sh -c "echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $VERSION_CODENAME-pgdg main' > /etc/apt/sources.list.d/pgdg.list"
           sudo apt update -y -qq --fix-missing
-          sudo apt -y install postgresql-client-15 postgresql-15 postgresql-server-dev-15
+          sudo apt -y install postgresql-client-15 postgresql-15 postgresql-server-dev-15 unixodbc-dev
           sudo apt -y autoremove && sudo apt -y clean
           sudo chmod a+rwx `/usr/lib/postgresql/15/bin/pg_config --pkglibdir` `/usr/lib/postgresql/15/bin/pg_config --sharedir`/extension /var/run/postgresql/
 
@@ -56,11 +56,20 @@ jobs:
       - name: Build docker images
         run: |
           docker compose -f wrappers/.ci/docker-compose-native.yaml up -d
+          if ! S3_INIT_STATUS=$(timeout 180 docker wait s3-init); then
+            docker logs s3-init
+            exit 1
+          fi
+          if [[ "$S3_INIT_STATUS" != "0" ]]; then
+            docker logs s3-init
+            exit 1
+          fi
 
       - name: Generate code coverage
         id: coverage
         env:
           RUSTFLAGS: "-D warnings -Clink-arg=-Wl,--unresolved-symbols=ignore-all"
+          SKIP_ICEBERG_TEST: ${{ github.repository_owner != 'supabase' && '1' || '' }}
         run: |
           source <(cargo llvm-cov show-env --export-prefix --no-cfg-coverage)
           cargo llvm-cov clean --workspace

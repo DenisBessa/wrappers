@@ -245,6 +245,30 @@ pub(crate) unsafe fn extract_from_op_expr(
                                 },
                             };
                             (Some(Cell::I64(0)), Some(param), None)
+                        // SYBASE FORK BEGIN: pushdown of evaluable expressions
+                        // without Var (NOW(), CURRENT_DATE, arithmetic on constants)
+                        // via PARAM_EXEC. Required by sybase_now_pushdown test and
+                        // production queries with `data_inicio < NOW()`. Not present
+                        // in upstream supabase/wrappers.
+                        } else if !pg_sys::contain_var_clause(right) {
+                            // Handle evaluable expressions without variable references
+                            // (e.g., NOW(), CURRENT_DATE, arithmetic on constants).
+                            // They are evaluated at execution time via the PARAM_EXEC
+                            // path; `FdwScanPrivate` serializes the expression node so
+                            // it survives the plan-cache `copyObject`.
+                            let type_oid = pg_sys::exprType(right);
+                            let param = Param {
+                                kind: pg_sys::ParamKind::PARAM_EXEC,
+                                id: 0,
+                                type_oid,
+                                eval_value: Mutex::new(None).into(),
+                                expr_eval: ExprEval {
+                                    expr: right as _,
+                                    expr_state: ptr::null_mut(),
+                                },
+                            };
+                            (Some(Cell::I64(0)), Some(param), None)
+                        // SYBASE FORK END
                         } else {
                             (None, None, None)
                         };

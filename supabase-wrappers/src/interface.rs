@@ -262,6 +262,9 @@ impl IntoDatum for Cell {
             || other == pg_sys::INT8OID
             || other == pg_sys::NUMERICOID
             || other == pg_sys::TEXTOID
+            || other == pg_sys::VARCHAROID
+            || other == pg_sys::BPCHAROID
+            || other == pg_sys::NAMEOID
             || other == pg_sys::DATEOID
             || other == pg_sys::TIMEOID
             || other == pg_sys::TIMESTAMPOID
@@ -277,6 +280,7 @@ impl IntoDatum for Cell {
             || other == pg_sys::FLOAT4ARRAYOID
             || other == pg_sys::FLOAT8ARRAYOID
             || other == pg_sys::TEXTARRAYOID
+            || other == pg_sys::VARCHARARRAYOID
     }
 }
 
@@ -312,7 +316,16 @@ impl FromDatum for Cell {
                 PgOid::BuiltIn(PgBuiltInOids::NUMERICOID) => {
                     AnyNumeric::from_datum(datum, is_null).map(Cell::Numeric)
                 }
-                PgOid::BuiltIn(PgBuiltInOids::TEXTOID) => {
+                PgOid::BuiltIn(PgBuiltInOids::TEXTOID)
+                | PgOid::BuiltIn(PgBuiltInOids::VARCHAROID)
+                | PgOid::BuiltIn(PgBuiltInOids::BPCHAROID)
+                | PgOid::BuiltIn(PgBuiltInOids::NAMEOID) => {
+                    // VARCHAR/BPCHAR/NAME share the same in-memory representation
+                    // as TEXT (varlena). Without this branch, a parametrized
+                    // join inner whose param type is VARCHAR (e.g. `customers_tax_numbers.tax_number`)
+                    // produces qual.value = Cell::I64(0) placeholder, deparsed to
+                    // `field = 0` — silently wrong rows. NAMEOID covers
+                    // catalog-introspection joins that flow into FT scans.
                     String::from_datum(datum, is_null).map(Cell::String)
                 }
                 PgOid::BuiltIn(PgBuiltInOids::DATEOID) => {
@@ -361,7 +374,8 @@ impl FromDatum for Cell {
                 PgOid::BuiltIn(PgBuiltInOids::FLOAT8ARRAYOID) => {
                     Vec::<Option<f64>>::from_datum(datum, false).map(Cell::F64Array)
                 }
-                PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID) => {
+                PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID)
+                | PgOid::BuiltIn(PgBuiltInOids::VARCHARARRAYOID) => {
                     Vec::<Option<String>>::from_datum(datum, false).map(Cell::StringArray)
                 }
                 PgOid::Custom(_) => {
@@ -563,28 +577,43 @@ pub struct Qual {
 }
 
 impl Qual {
+    // SYBASE FORK: `value_const` is crate-private, so FDW crates need a
+    // constructor to build quals in their own unit tests.
+    pub fn new(field: &str, operator: &str, value: Value, use_or: bool) -> Self {
+        Self {
+            field: field.to_string(),
+            operator: operator.to_string(),
+            value,
+            use_or,
+            param: None,
+            value_const: None,
+        }
+    }
+
     pub fn deparse(&self) -> String {
         let mut formatter = DefaultFormatter::new();
         self.deparse_with_fmt(&mut formatter)
     }
 
     pub fn deparse_with_fmt<T: CellFormatter>(&self, t: &mut T) -> String {
-        if self.use_or {
-            match &self.value {
-                Value::Cell(_) => unreachable!(),
-                Value::Array(cells) => {
-                    let conds: Vec<String> = cells
-                        .iter()
-                        .map(|cell| {
-                            format!("{} {} {}", self.field, self.operator, t.fmt_cell(cell))
-                        })
-                        .collect();
-                    conds.join(" or ")
-                }
+        match &self.value {
+            Value::Array(cells) => {
+                // Postgres ScalarArrayOpExpr: use_or=true (ANY) joins via OR,
+                // use_or=false (ALL) joins via AND. PG produces use_or=false
+                // for `NOT IN (...)` — represented as `<> ALL (array)`. Both
+                // branches must be rendered or downstream FDWs panic.
+                let joiner = if self.use_or { " or " } else { " and " };
+                let conds: Vec<String> = cells
+                    .iter()
+                    .map(|cell| format!("{} {} {}", self.field, self.operator, t.fmt_cell(cell)))
+                    .collect();
+                conds.join(joiner)
             }
-        } else {
-            match &self.value {
-                Value::Cell(cell) => match self.operator.as_str() {
+            Value::Cell(cell) => {
+                if self.use_or {
+                    return format!("{} {} {}", self.field, self.operator, t.fmt_cell(cell));
+                }
+                match self.operator.as_str() {
                     "is" | "is not" => match cell {
                         Cell::String(cell) if cell == "null" => {
                             format!("{} {} null", self.field, self.operator)
@@ -594,8 +623,7 @@ impl Qual {
                     "~~" => format!("{} like {}", self.field, t.fmt_cell(cell)),
                     "!~~" => format!("{} not like {}", self.field, t.fmt_cell(cell)),
                     _ => format!("{} {} {}", self.field, self.operator, t.fmt_cell(cell)),
-                },
-                Value::Array(_) => unreachable!(),
+                }
             }
         }
     }
@@ -1334,6 +1362,44 @@ pub trait ForeignDataWrapper<E: Into<ErrorReport>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Postgres represents `NOT IN (...)` as a ScalarArrayOpExpr with
+    // operator=`<>` and useOr=false (i.e. `<> ALL (array)`). Before this
+    // branch was handled, `deparse_with_fmt` panicked, surfaced in prod as
+    // `XX000 internal error: entered unreachable code`.
+    #[test]
+    fn deparse_array_qual_with_useor_false_emits_and_join() {
+        let qual = Qual {
+            field: "situacao_ent".to_string(),
+            operator: "<>".to_string(),
+            value: Value::Array(vec![Cell::I32(1), Cell::I32(2), Cell::I32(3)]),
+            use_or: false,
+            param: None,
+            value_const: None,
+        };
+        let mut fmt = DefaultFormatter::new();
+        assert_eq!(
+            qual.deparse_with_fmt(&mut fmt),
+            "situacao_ent <> 1 and situacao_ent <> 2 and situacao_ent <> 3"
+        );
+    }
+
+    #[test]
+    fn deparse_array_qual_with_useor_true_emits_or_join() {
+        let qual = Qual {
+            field: "codi_emp".to_string(),
+            operator: "=".to_string(),
+            value: Value::Array(vec![Cell::I32(10), Cell::I32(20)]),
+            use_or: true,
+            param: None,
+            value_const: None,
+        };
+        let mut fmt = DefaultFormatter::new();
+        assert_eq!(
+            qual.deparse_with_fmt(&mut fmt),
+            "codi_emp = 10 or codi_emp = 20"
+        );
+    }
 
     #[test]
     fn test_cell_into_datum_type_oid_is_invalid() {
