@@ -2,9 +2,13 @@ use odbc_api::{
     BlockCursor, Connection, ConnectionOptions, Cursor, CursorImpl, Environment,
     buffers::TextRowSet, handles::StatementImpl,
 };
-use pgrx::{PgBuiltInOids, PgOid, pg_sys::Oid, prelude::Date};
+use pgrx::{
+    PgBuiltInOids, PgOid, PgXactCallbackEvent, pg_sys::Oid, prelude::Date, register_xact_callback,
+};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{LazyLock, Mutex};
 
 use supabase_wrappers::prelude::*;
@@ -37,6 +41,45 @@ pub(super) fn connect_unlocked(conn_str: &str) -> Result<Connection<'static>, od
     // SET TEMPORARY OPTION scopes to this connection only, no side effects
     conn.execute("SET TEMPORARY OPTION isolation_level = 0", ())?;
     Ok(conn)
+}
+
+// Idle connections of this backend, by connection string. Each Sybase login
+// costs ~175 ms, which every foreign scan used to pay; now the scans of one
+// transaction share them. Only connections whose cursor was drained to EOF
+// come back here (see `close_stream`), so the wire protocol is in sync.
+// Postgres backends are single-threaded, hence `thread_local`.
+thread_local! {
+    static IDLE_CONNS: RefCell<HashMap<String, Vec<Connection<'static>>>> =
+        RefCell::new(HashMap::new());
+    static CLEAR_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Take an idle connection for `conn_str`, or open a new one.
+pub(super) fn checkout(conn_str: &str) -> Result<Connection<'static>, odbc_api::Error> {
+    match IDLE_CONNS.with_borrow_mut(|pool| pool.get_mut(conn_str).and_then(Vec::pop)) {
+        Some(conn) => Ok(conn),
+        None => connect_unlocked(conn_str),
+    }
+}
+
+/// Return a connection with no open cursor to the pool, until the end of
+/// the transaction.
+pub(super) fn checkin(conn_str: &str, conn: Connection<'static>) {
+    IDLE_CONNS.with_borrow_mut(|pool| pool.entry(conn_str.to_owned()).or_default().push(conn));
+
+    if !CLEAR_REGISTERED.replace(true) {
+        // PreCommit, not Commit: an ERROR after the commit record is a PANIC.
+        register_xact_callback(PgXactCallbackEvent::PreCommit, clear_idle_conns);
+        register_xact_callback(PgXactCallbackEvent::Abort, clear_idle_conns);
+    }
+}
+
+// The shared Domínio server must not keep logins of idle backends.
+fn clear_idle_conns() {
+    CLEAR_REGISTERED.set(false);
+    let conns = IDLE_CONNS.take();
+    // odbc-api panics when a disconnect fails; that must not fail the query.
+    let _ = catch_unwind(AssertUnwindSafe(move || drop(conns)));
 }
 
 // Cache for table row counts, avoiding repeated COUNT(*) queries during planning.
@@ -567,20 +610,17 @@ pub(crate) struct SybaseFdw {
     // ~609k rows of `efentradaspag`.
     stream: Option<StreamingScan>,
 
-    // Lazy execution support for parameterized queries.
-    // When quals contain parameters (from JOINs), we defer query execution
-    // until iter_scan, when the parameter values have been evaluated.
+    // Lazy execution: the remote query runs on the first `iter_scan`, not in
+    // `begin_scan`. Postgres begins every scan of the plan, including the
+    // ones it never runs (e.g. a CTE nobody reads); those must not connect.
+    // Parameterized quals (from JOINs) are also only known by then.
     query_executed: bool,
     stored_quals: Vec<Qual>,
     stored_sorts: Vec<Sort>,
     stored_limit: Option<Limit>,
 
-    // Cached ODBC connection, reused by rescans while an executor scan is
-    // active to avoid connection overhead on correlated subqueries.
-    // `execute_query` `take()`s it to hand ownership to `StreamingScan` and
-    // `close_stream` recovers it via `StreamingScan::into_connection`.
-    // `end_scan` drops it.
-    cached_conn: Option<Connection<'static>>,
+    // Pushed-down aggregate SQL; `None` for a plain table scan.
+    aggregate_sql: Option<String>,
 }
 
 impl SybaseFdw {
@@ -818,22 +858,15 @@ impl SybaseFdw {
 
     /// Open a streaming cursor for `sql`. Replaces any in-progress stream.
     ///
-    /// Connection management: we take the cached connection (or create one
-    /// if absent), hand it to `StreamingScan::open`, and store the resulting
-    /// stream. The connection is recovered later by `close_stream`.
+    /// Connection management: we take a pooled connection (or open one),
+    /// hand it to `StreamingScan::open`, and store the resulting stream. The
+    /// connection goes back to the pool in `close_stream`.
     fn execute_query(&mut self, sql: &str) -> SybaseFdwResult<()> {
         // Close any previous stream and recover its connection. This handles
-        // re-execution (e.g. parameterized scans where iter_scan triggers a
-        // late execute_query, or aggregate vs base-rel paths racing on the
-        // same state).
+        // re-execution (e.g. rescans).
         self.close_stream();
 
-        let conn = match self.cached_conn.take() {
-            Some(c) => c,
-            None => connect_unlocked(&self.conn_str)?,
-        };
-
-        match StreamingScan::open(conn, sql) {
+        match StreamingScan::open(checkout(&self.conn_str)?, sql) {
             Ok(Some(stream)) => {
                 self.stream = Some(stream);
                 Ok(())
@@ -850,8 +883,7 @@ impl SybaseFdw {
     }
 
     /// Drop any in-progress stream. If the cursor was drained to EOF, the
-    /// underlying connection is recycled into `cached_conn` for the next
-    /// rescan; if not (e.g. PG stopped iterating early because of LIMIT or a
+    /// underlying connection goes back to the pool for the next scan; if not (e.g. PG stopped iterating early because of LIMIT or a
     /// JOIN early-exit), the connection is dropped — closing a FreeTDS
     /// cursor mid-stream leaves the wire protocol out of sync ("Bad token
     /// from the server: Datastream processing out of sync") on the next
@@ -860,7 +892,7 @@ impl SybaseFdw {
         if let Some(stream) = self.stream.take()
             && stream.eof
         {
-            self.cached_conn = Some(stream.into_connection());
+            checkin(&self.conn_str, stream.into_connection());
         }
         // else: drop the whole StreamingScan including the connection;
         // the next scan will open a fresh one.
@@ -872,8 +904,13 @@ impl SybaseFdw {
         sorts: &[Sort],
         limit: &Option<Limit>,
     ) -> SybaseFdwResult<()> {
-        let tgt_cols = self.tgt_cols.clone();
-        let sql = self.deparse(quals, &tgt_cols, sorts, limit)?;
+        let sql = match &self.aggregate_sql {
+            Some(sql) => sql.clone(),
+            None => {
+                let tgt_cols = self.tgt_cols.clone();
+                self.deparse(quals, &tgt_cols, sorts, limit)?
+            }
+        };
         self.execute_query(&sql)?;
         self.query_executed = true;
 
@@ -928,7 +965,7 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
             stored_quals: Vec::new(),
             stored_sorts: Vec::new(),
             stored_limit: None,
-            cached_conn: None,
+            aggregate_sql: None,
         })
     }
 
@@ -1105,20 +1142,14 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
         self.stored_quals = quals.to_vec();
         self.stored_sorts = sorts.to_vec();
         self.stored_limit = limit.clone();
+        self.aggregate_sql = None;
 
-        // When quals have unevaluated parameters (from JOINs), defer query
-        // execution to iter_scan where the parameter values will be available.
-        let has_params = quals.iter().any(|q| q.param.is_some());
-
-        if has_params {
-            Ok(())
-        } else {
-            self.do_execute_query_with_stats(quals, sorts, limit)
-        }
+        Ok(())
     }
 
     fn iter_scan(&mut self, row: &mut Row) -> SybaseFdwResult<Option<()>> {
-        // Lazy execution: parameters from JOINs are now evaluated
+        // Lazy execution: the first row asked runs the query, with the
+        // parameters from JOINs already evaluated.
         if !self.query_executed {
             // Refresh stored quals with current parameter values.
             // The framework's assign_paramenter_value updates the shared
@@ -1171,26 +1202,15 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
         // re_scan_foreign_scan only invokes re_scan when the parameter
         // fingerprint is unchanged (fresh-param scans go through
         // end_scan + begin_scan), so this is the in-loop rescan path.
+        // The next `iter_scan` re-executes, like `begin_scan`.
         self.close_stream();
         self.query_executed = false;
-
-        if self.stored_quals.iter().all(|q| q.param.is_none()) {
-            let quals = self.stored_quals.clone();
-            let sorts = self.stored_sorts.clone();
-            let limit = self.stored_limit.clone();
-            self.do_execute_query_with_stats(&quals, &sorts, &limit)?;
-        }
-        // Parameterized rescans fall back to the lazy path in `iter_scan`,
-        // matching `begin_scan`'s deferred-execution behavior.
 
         Ok(())
     }
 
     fn end_scan(&mut self) -> SybaseFdwResult<()> {
         self.close_stream();
-
-        // Keep the connection cache only for rescans performed before this hook.
-        self.cached_conn = None;
         Ok(())
     }
 
@@ -1237,9 +1257,13 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
         }
         self.tgt_cols = tgt_cols;
 
-        let sql = deparse_aggregate_sybase(&self.table, aggregates, group_by, quals);
-        self.execute_query(&sql)?;
-        self.query_executed = true;
+        // Runs on the first `iter_scan`, like a table scan.
+        self.aggregate_sql = Some(deparse_aggregate_sybase(
+            &self.table,
+            aggregates,
+            group_by,
+            quals,
+        ));
         Ok(())
     }
 

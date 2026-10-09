@@ -86,7 +86,7 @@ make shell-sa     # dbisql no Sybase
 │   ├── 080_null_handling.sql
 │   ├── bug1_segfault_correlated_subq.sql   # repro original do bug #1
 │   ├── bug1b_segfault_high_iterations.sql  # alta cardinalidade
-│   ├── bug1c_stress_repeat.sql             # stress de cached_conn
+│   ├── bug1c_stress_repeat.sql             # stress do pool de conexões
 │   ├── bug2_unrecognized_node_type.sql     # repro original do bug #2
 │   └── bug2b_generic_plan.sql              # PREPARE+7×EXECUTE — regressão
 └── results/                     # gerado pelo runner: stdout/stderr de cada fixture

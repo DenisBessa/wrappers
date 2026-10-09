@@ -6,7 +6,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use odbc_api::{Cursor, ResultSetMetadata, buffers::TextRowSet};
+use odbc_api::{Connection, Cursor, ResultSetMetadata, buffers::TextRowSet};
 use pgrx::{
     AllocatedByRust, FromDatum, IntoDatum, PgBox,
     list::List,
@@ -20,7 +20,7 @@ use std::os::raw::c_int;
 use std::ptr;
 use std::sync::OnceLock;
 
-use super::sybase_fdw::value_to_cell;
+use super::sybase_fdw::{checkin, checkout, value_to_cell};
 use supabase_wrappers::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -65,8 +65,10 @@ struct JoinScanState {
     conn_str: String,
     /// PostgreSQL type of each result column, in result order
     type_oids: Vec<Oid>,
-    /// Fetched result rows (string values from ODBC)
+    /// Fetched result rows (string values from ODBC), filled on the first
+    /// IterateForeignScan: a scan Postgres never runs must not connect.
     rows: Vec<Vec<Option<String>>>,
+    executed: bool,
     /// Current row index during iteration
     row_idx: usize,
     /// Pre-allocated values array for ExecStoreVirtualTuple
@@ -904,6 +906,7 @@ unsafe extern "C-unwind" fn sybase_begin_foreign_scan(
                 .map(|c| Oid::from_datum(c.constvalue, false).unwrap())
                 .collect(),
             rows: Vec::new(),
+            executed: false,
             row_idx: 0,
             values: Vec::new(),
             nulls: Vec::new(),
@@ -911,10 +914,6 @@ unsafe extern "C-unwind" fn sybase_begin_foreign_scan(
 
         if eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as c_int == 0 {
             state.conn_str = get_server_conn_str(server_oid).unwrap_or_default();
-
-            // Execute the join SQL via ODBC. An ERROR here unwinds and drops
-            // `state`; nothing is leaked into the node yet.
-            execute_join_query(&mut state);
 
             // Initialize values/nulls arrays
             let slot = (*node).ss.ss_ScanTupleSlot;
@@ -929,65 +928,44 @@ unsafe extern "C-unwind" fn sybase_begin_foreign_scan(
 }
 
 fn execute_join_query(state: &mut JoinScanState) {
-    let conn = match super::sybase_fdw::connect_unlocked(&state.conn_str) {
-        Ok(c) => c,
-        Err(e) => {
-            pgrx::error!("SybaseFdw join: ODBC connection failed: {e}");
-        }
+    let conn = checkout(&state.conn_str)
+        .unwrap_or_else(|e| pgrx::error!("SybaseFdw join: ODBC connection failed: {e}"));
+
+    if let Err(e) = fetch_join_rows(&conn, state) {
+        pgrx::error!("SybaseFdw join: query failed: {e}\nSQL: {}", state.sql);
+    }
+
+    // Every row was fetched, so no cursor is left open on the connection.
+    checkin(&state.conn_str, conn);
+    state.executed = true;
+}
+
+fn fetch_join_rows(
+    conn: &Connection<'static>,
+    state: &mut JoinScanState,
+) -> Result<(), odbc_api::Error> {
+    let Some(mut cursor) = conn.execute(&state.sql, ())? else {
+        return Ok(());
     };
+    let num_cols = cursor.num_result_cols()? as usize;
+    let batch_size = 5000;
+    let mut buffers = TextRowSet::for_cursor(batch_size, &mut cursor, Some(4096))?;
+    let mut row_set_cursor = cursor.bind_buffer(&mut buffers)?;
 
-    match conn.execute(&state.sql, ()) {
-        Ok(Some(mut cursor)) => {
-            let num_cols = match cursor.num_result_cols() {
-                Ok(n) => n as usize,
-                Err(e) => {
-                    pgrx::error!("SybaseFdw join: failed to get column count: {e}");
-                }
-            };
-
-            let batch_size = 5000;
-            let mut buffers = match TextRowSet::for_cursor(batch_size, &mut cursor, Some(4096)) {
-                Ok(b) => b,
-                Err(e) => {
-                    pgrx::error!("SybaseFdw join: failed to create buffers: {e}");
-                }
-            };
-            let mut row_set_cursor = match cursor.bind_buffer(&mut buffers) {
-                Ok(c) => c,
-                Err(e) => {
-                    pgrx::error!("SybaseFdw join: failed to bind buffer: {e}");
-                }
-            };
-
-            loop {
-                match row_set_cursor.fetch() {
-                    Ok(Some(batch)) => {
-                        for row_idx in 0..batch.num_rows() {
-                            let mut values = Vec::with_capacity(num_cols);
-                            for col_idx in 0..num_cols {
-                                let value = batch
-                                    .at(col_idx, row_idx)
-                                    .map(|bytes| String::from_utf8_lossy(bytes).to_string());
-                                values.push(value);
-                            }
-                            state.rows.push(values);
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        pgrx::error!("SybaseFdw join: fetch error: {e}");
-                    }
-                }
+    while let Some(batch) = row_set_cursor.fetch()? {
+        for row_idx in 0..batch.num_rows() {
+            let mut values = Vec::with_capacity(num_cols);
+            for col_idx in 0..num_cols {
+                let value = batch
+                    .at(col_idx, row_idx)
+                    .map(|bytes| String::from_utf8_lossy(bytes).to_string());
+                values.push(value);
             }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            pgrx::error!(
-                "SybaseFdw join: query execution failed: {e}\nSQL: {}",
-                state.sql
-            );
+            state.rows.push(values);
         }
     }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,6 +988,10 @@ unsafe extern "C-unwind" fn sybase_iterate_foreign_scan(
         // --- Join scan ---
         let state = &mut *((*node).fdw_state as *mut JoinScanState);
         let slot = (*node).ss.ss_ScanTupleSlot;
+
+        if !state.executed {
+            execute_join_query(state);
+        }
 
         // Clear the slot
         if let Some(clear) = (*(*slot).tts_ops).clear {
