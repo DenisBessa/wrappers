@@ -107,8 +107,11 @@ fn clear_xact_conns() {
     let conns = IDLE_CONNS.take();
     // odbc-api panics when a disconnect fails; that must not fail the query.
     // One catch per connection: a panic while unwinding another would abort.
+    // Dropping drains the rest of the result set (see `StreamingScan::drop`):
+    // closing a FreeTDS cursor with rows still in flight blocks forever in
+    // poll, waiting for a cancel ack that SQL Anywhere never sends.
     for stream in streams.into_values() {
-        let _ = catch_unwind(AssertUnwindSafe(move || stream.abandon()));
+        let _ = catch_unwind(AssertUnwindSafe(move || drop(stream)));
     }
     for conn in conns.into_values().flatten() {
         let _ = catch_unwind(AssertUnwindSafe(move || drop(conn)));
@@ -621,14 +624,6 @@ impl StreamingScan {
             // `me` itself is `ManuallyDrop`, so falling out of scope is safe.
             *boxed
         }
-    }
-
-    /// Close cursor and connection without draining the rest of the result
-    /// set: after an abort (e.g. a statement timeout on a huge scan) draining
-    /// would hold the backend for as long as the scan. The connection is not
-    /// reused, so the wire state left behind does not matter.
-    fn abandon(mut self) {
-        self.eof = true;
     }
 }
 

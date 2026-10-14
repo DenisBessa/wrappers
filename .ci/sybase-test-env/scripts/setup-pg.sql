@@ -109,6 +109,13 @@ CREATE FOREIGN TABLE dominio.fodepto_slow (
 ) SERVER sybase_test_server
   OPTIONS (table 'bethadba.fodepto');
 
+DROP FOREIGN TABLE IF EXISTS dominio.grande CASCADE;
+CREATE FOREIGN TABLE dominio.grande (
+    id     integer NOT NULL,
+    texto  text
+) SERVER sybase_test_server
+  OPTIONS (table 'bethadba.grande');
+
 -- ============================================================================
 -- Módulo de Folha (Payroll). Espelha a topologia em que os ex-pg_tests
 -- consumiam tabelas Sybase reais — agora sustentado pelo schema em

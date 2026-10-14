@@ -121,3 +121,13 @@ CREATE TABLE bethadba.foempregados_alteracao_contratual (
     salario         NUMERIC(15,2),
     PRIMARY KEY (codi_emp, i_empregados, data_alteracao)
 );
+
+-- ============================================================================
+-- Resultado grande: um scan abortado no meio (timeout, ERROR) ainda tem linhas
+-- em trânsito quando a transação termina. Ver fixture 151.
+-- ============================================================================
+DROP TABLE IF EXISTS bethadba.grande;
+CREATE TABLE bethadba.grande (
+    id     INTEGER NOT NULL PRIMARY KEY,
+    texto  VARCHAR(200)
+);

@@ -167,3 +167,8 @@ BEGIN
 END;
 
 COMMIT;
+
+-- grande — 1 milhão de linhas de ~150 bytes.
+INSERT INTO bethadba.grande SELECT row_num, repeat('x', 150) FROM sa_rowgenerator(1, 1000000);
+
+COMMIT;

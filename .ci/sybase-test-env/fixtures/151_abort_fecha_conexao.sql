@@ -41,5 +41,14 @@ BEGIN
     END IF;
 END $$;
 
+-- Cancelamento com linhas ainda em trânsito: fechar o cursor sem drená-lo
+-- deixava o FreeTDS em poll para sempre, à espera do ack de um cancel que o
+-- SQL Anywhere não manda. Se regredir, esta fixture trava em vez de falhar.
+\set ON_ERROR_STOP off
+SET statement_timeout = '1s';
+SELECT pg_sleep(0.001), id, texto FROM dominio.grande;
+RESET statement_timeout;
+\set ON_ERROR_STOP on
+
 -- O backend segue conectando depois dos aborts.
 SELECT count(*) FROM dominio.geempre_slow;
