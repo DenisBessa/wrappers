@@ -51,6 +51,13 @@ pub(super) fn connect_unlocked(conn_str: &str) -> Result<Connection<'static>, od
 thread_local! {
     static IDLE_CONNS: RefCell<HashMap<String, Vec<Connection<'static>>>> =
         RefCell::new(HashMap::new());
+    // Streams with an open cursor, by id. The framework frees the scan state
+    // only in EndForeignScan, which an aborted query (cancel, timeout, ERROR)
+    // never reaches: a stream kept in the state leaked its connection, 2 fds
+    // each, until the backend ran out of descriptors. Kept here instead, the
+    // xact callback closes it.
+    static OPEN_STREAMS: RefCell<HashMap<u64, StreamingScan>> = RefCell::new(HashMap::new());
+    static NEXT_STREAM_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CLEAR_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -66,20 +73,46 @@ pub(super) fn checkout(conn_str: &str) -> Result<Connection<'static>, odbc_api::
 /// the transaction.
 pub(super) fn checkin(conn_str: &str, conn: Connection<'static>) {
     IDLE_CONNS.with_borrow_mut(|pool| pool.entry(conn_str.to_owned()).or_default().push(conn));
+    register_xact_cleanup();
+}
 
+/// Keep a stream until `close_registered_stream` or the end of the
+/// transaction.
+fn register_stream(stream: StreamingScan) -> u64 {
+    let id = NEXT_STREAM_ID.replace(NEXT_STREAM_ID.get().wrapping_add(1));
+    OPEN_STREAMS.with_borrow_mut(|streams| streams.insert(id, stream));
+    register_xact_cleanup();
+    id
+}
+
+/// Remove a stream from the registry; `None` if the transaction already
+/// closed it.
+fn take_stream(id: u64) -> Option<StreamingScan> {
+    OPEN_STREAMS.with_borrow_mut(|streams| streams.remove(&id))
+}
+
+fn register_xact_cleanup() {
     if !CLEAR_REGISTERED.replace(true) {
         // PreCommit, not Commit: an ERROR after the commit record is a PANIC.
-        register_xact_callback(PgXactCallbackEvent::PreCommit, clear_idle_conns);
-        register_xact_callback(PgXactCallbackEvent::Abort, clear_idle_conns);
+        register_xact_callback(PgXactCallbackEvent::PreCommit, clear_xact_conns);
+        register_xact_callback(PgXactCallbackEvent::Abort, clear_xact_conns);
     }
 }
 
-// The shared Domínio server must not keep logins of idle backends.
-fn clear_idle_conns() {
+// The shared Domínio server must not keep logins of idle backends, and an
+// aborted scan must not keep its connection.
+fn clear_xact_conns() {
     CLEAR_REGISTERED.set(false);
+    let streams = OPEN_STREAMS.take();
     let conns = IDLE_CONNS.take();
     // odbc-api panics when a disconnect fails; that must not fail the query.
-    let _ = catch_unwind(AssertUnwindSafe(move || drop(conns)));
+    // One catch per connection: a panic while unwinding another would abort.
+    for stream in streams.into_values() {
+        let _ = catch_unwind(AssertUnwindSafe(move || stream.abandon()));
+    }
+    for conn in conns.into_values().flatten() {
+        let _ = catch_unwind(AssertUnwindSafe(move || drop(conn)));
+    }
 }
 
 // Cache for table row counts, avoiding repeated COUNT(*) queries during planning.
@@ -589,6 +622,14 @@ impl StreamingScan {
             *boxed
         }
     }
+
+    /// Close cursor and connection without draining the rest of the result
+    /// set: after an abort (e.g. a statement timeout on a huge scan) draining
+    /// would hold the backend for as long as the scan. The connection is not
+    /// reused, so the wire state left behind does not matter.
+    fn abandon(mut self) {
+        self.eof = true;
+    }
 }
 
 #[wrappers_fdw(
@@ -607,8 +648,9 @@ pub(crate) struct SybaseFdw {
     // which materialised every matching row into Rust memory before
     // returning the first one to Postgres — a pattern that OOM-killed
     // supabase-db on prod when a CTE forced full-table SUM/GROUP BY over
-    // ~609k rows of `efentradaspag`.
-    stream: Option<StreamingScan>,
+    // ~609k rows of `efentradaspag`. The stream itself lives in
+    // `OPEN_STREAMS`, so an aborted transaction can close it.
+    stream: Option<u64>,
 
     // Lazy execution: the remote query runs on the first `iter_scan`, not in
     // `begin_scan`. Postgres begins every scan of the plan, including the
@@ -868,7 +910,7 @@ impl SybaseFdw {
 
         match StreamingScan::open(checkout(&self.conn_str)?, sql) {
             Ok(Some(stream)) => {
-                self.stream = Some(stream);
+                self.stream = Some(register_stream(stream));
                 Ok(())
             }
             Ok(None) => {
@@ -889,7 +931,7 @@ impl SybaseFdw {
     /// from the server: Datastream processing out of sync") on the next
     /// query over the same connection.
     fn close_stream(&mut self) {
-        if let Some(stream) = self.stream.take()
+        if let Some(stream) = self.stream.take().and_then(take_stream)
             && stream.eof
         {
             checkin(&self.conn_str, stream.into_connection());
@@ -1173,15 +1215,20 @@ impl ForeignDataWrapper<SybaseFdwError> for SybaseFdw {
         // Pull the next row from the streaming cursor. `next_row` handles
         // batch refills internally; it returns `None` once the result set
         // is exhausted.
-        let stream = match self.stream.as_mut() {
-            Some(s) => s,
-            None => return Ok(None),
+        let Some(id) = self.stream else {
+            return Ok(None);
         };
 
         // Collect the raw values out of the borrow before calling
         // `value_to_cell` (which can't run while `stream` is borrowed).
-        let owned_values: Vec<Option<String>> = match stream.next_row()? {
-            Some(values) => values.to_vec(),
+        let next = OPEN_STREAMS.with_borrow_mut(|streams| {
+            streams
+                .get_mut(&id)
+                .map(|stream| stream.next_row().map(|values| values.map(<[_]>::to_vec)))
+                .transpose()
+        })?;
+        let owned_values: Vec<Option<String>> = match next.flatten() {
+            Some(values) => values,
             None => return Ok(None),
         };
 
