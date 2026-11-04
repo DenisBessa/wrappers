@@ -490,16 +490,33 @@ pub(super) unsafe fn extract_target_columns(
                 for var in col_vars.iter() {
                     let var: pg_sys::Var = *(*var as *mut pg_sys::Var);
                     let rte = pg_sys::planner_rt_fetch(var.varno as _, root);
-                    let attno = var.varattno;
-                    let attname = pg_sys::get_attname((*rte).relid, attno, true);
-                    if !attname.is_null() {
+                    // SYBASE FORK: a whole-row Var (`to_jsonb(t)`, `t.*` in a
+                    // function) has attno 0 and needs every column; without
+                    // this the columns outside the WHERE came back null.
+                    let attnos = if var.varattno == 0 {
+                        let rel =
+                            pgrx::rel::PgRelation::with_lock((*rte).relid, pg_sys::NoLock as _);
+                        (1..=rel.tuple_desc().len() as pg_sys::AttrNumber).collect()
+                    } else {
+                        vec![var.varattno]
+                    };
+                    for attno in attnos {
+                        let attname = pg_sys::get_attname((*rte).relid, attno, true);
+                        let type_oid = pg_sys::get_atttype((*rte).relid, attno);
+                        // dropped columns have no type; a whole-row Var repeats columns
+                        if attname.is_null()
+                            || type_oid == pg_sys::InvalidOid
+                            || ret.iter().any(|c: &Column| c.num == attno as usize)
+                        {
+                            continue;
+                        }
+
                         // generated column is not supported
                         if pg_sys::get_attgenerated((*rte).relid, attno) > 0 {
                             report_warning("generated column is not supported");
                             continue;
                         }
 
-                        let type_oid = pg_sys::get_atttype((*rte).relid, attno);
                         ret.push(Column {
                             name: CStr::from_ptr(attname).to_str().unwrap().to_owned(),
                             num: attno as usize,

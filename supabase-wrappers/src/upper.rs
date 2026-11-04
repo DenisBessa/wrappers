@@ -91,6 +91,67 @@ unsafe fn extract_column_from_var(
     }
 }
 
+/// Shape of one item of the grouped relation's target list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum TargetItem {
+    /// A plain column (`varattno`), which must be a GROUP BY column.
+    Column(pg_sys::AttrNumber),
+    Aggregate,
+    /// Constants and expressions (`'x'`, `coalesce(sum(a), 0)`), which the
+    /// remote SELECT cannot reproduce.
+    Other,
+}
+
+/// Classify the grouped relation's target list.
+///
+/// # Safety
+///
+/// `exprs` must be a valid pg_sys::List of expression nodes (or null).
+pub(crate) unsafe fn target_items(exprs: *mut pg_sys::List) -> Vec<TargetItem> {
+    unsafe {
+        list_iter::<pg_sys::Node>(exprs)
+            .map(|expr| match (*expr).type_ {
+                pg_sys::NodeTag::T_Var => {
+                    TargetItem::Column((*(expr as *mut pg_sys::Var)).varattno)
+                }
+                pg_sys::NodeTag::T_Aggref => TargetItem::Aggregate,
+                _ => TargetItem::Other,
+            })
+            .collect()
+    }
+}
+
+/// 1-based tuple slot of each GROUP BY column and of each aggregate (in
+/// target-list order). The remote row comes as `[group_by..., aggregates...]`
+/// while the scan tuple follows the target list, so each value must land in
+/// its own slot. `None` when the target list has anything else, or misses or
+/// repeats a GROUP BY column: the remote row would not fill the tuple and the
+/// executor would read Datums of the wrong type (signal 11).
+pub(crate) fn tuple_slots(
+    items: &[TargetItem],
+    group_by: &[pg_sys::AttrNumber],
+) -> Option<(Vec<usize>, Vec<usize>)> {
+    let mut group_slots = vec![0usize; group_by.len()];
+    let mut aggregate_slots = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        match item {
+            TargetItem::Aggregate => aggregate_slots.push(i + 1),
+            TargetItem::Column(attno) => {
+                let k = group_by.iter().position(|g| g == attno)?;
+                if group_slots[k] != 0 {
+                    return None;
+                }
+                group_slots[k] = i + 1;
+            }
+            TargetItem::Other => return None,
+        }
+    }
+    group_slots
+        .iter()
+        .all(|&slot| slot != 0)
+        .then_some((group_slots, aggregate_slots))
+}
+
 /// Extract aggregate information from the query's output relation target list.
 ///
 /// # Safety
@@ -292,6 +353,13 @@ pub(super) extern "C-unwind" fn get_foreign_upper_paths<
     }
 
     unsafe {
+        // Only a base relation carries an FdwState in fdw_private. A join rel
+        // pushed down by an FDW hook (sybase_fdw's join.rs) carries its own
+        // plan data there, and reading it as FdwState corrupts memory.
+        if (*input_rel).reloptkind != pg_sys::RelOptKind::RELOPT_BASEREL {
+            return;
+        }
+
         // Get the FDW state from the input relation (set during get_foreign_rel_size)
         let fdw_private = (*input_rel).fdw_private;
         if fdw_private.is_null() {
@@ -303,6 +371,21 @@ pub(super) extern "C-unwind" fn get_foreign_upper_paths<
         // Check if FDW supports any aggregates
         let supported = W::supported_aggregates();
         if supported.is_empty() {
+            return;
+        }
+
+        // A WHERE condition that could not become a Qual is only checked
+        // locally on scanned rows; the remote aggregate would ignore it and
+        // return wrong totals. extract_quals yields at most one Qual per
+        // RestrictInfo, so fewer Quals means something was left out.
+        let restrictions = (*input_rel).baserestrictinfo;
+        let restriction_count = if restrictions.is_null() {
+            0
+        } else {
+            (*restrictions).length as usize
+        };
+        if state.quals.len() != restriction_count {
+            debug2!("WHERE has conditions that cannot be pushed down, skipping aggregate pushdown");
             return;
         }
 
@@ -335,6 +418,20 @@ pub(super) extern "C-unwind" fn get_foreign_upper_paths<
         // Check if GROUP BY is supported (if present)
         if !group_by.is_empty() && !W::supports_group_by() {
             debug2!("GROUP BY not supported, skipping pushdown");
+            return;
+        }
+
+        let group_attnos: Vec<pg_sys::AttrNumber> = group_by
+            .iter()
+            .map(|c| c.num as pg_sys::AttrNumber)
+            .collect();
+        if tuple_slots(
+            &target_items((*(*output_rel).reltarget).exprs),
+            &group_attnos,
+        )
+        .is_none()
+        {
+            debug2!("Target list is not only GROUP BY columns and aggregates, skipping pushdown");
             return;
         }
 
@@ -402,5 +499,48 @@ pub(super) extern "C-unwind" fn get_foreign_upper_paths<
             aggregates.len(),
             group_by.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TargetItem::*, tuple_slots};
+
+    // KOROK-131 (29/10): `SELECT 'acu', count(*)` pushed only the count, and
+    // the executor read the int8 as the text constant.
+    #[test]
+    fn recusa_constante_no_select() {
+        assert_eq!(tuple_slots(&[Other, Aggregate], &[]), None);
+    }
+
+    // KOROK-131 (04/11): `SELECT situacao_sai, count(*), sum(...) GROUP BY 1`
+    // and the same with the aggregates before the column.
+    #[test]
+    fn coloca_cada_valor_na_posicao_do_select() {
+        assert_eq!(
+            tuple_slots(&[Column(5), Aggregate, Aggregate], &[5]),
+            Some((vec![1], vec![2, 3]))
+        );
+        assert_eq!(
+            tuple_slots(&[Aggregate, Column(5)], &[5]),
+            Some((vec![2], vec![1]))
+        );
+    }
+
+    // `SELECT codi_ent, codi_emp, sum(...) GROUP BY codi_emp, codi_ent`
+    // swapped the columns (TESTES-DOMINIO.md, 5.5).
+    #[test]
+    fn segue_a_ordem_do_select_e_nao_a_do_group_by() {
+        assert_eq!(
+            tuple_slots(&[Column(2), Column(1), Aggregate], &[1, 2]),
+            Some((vec![2, 1], vec![3]))
+        );
+    }
+
+    #[test]
+    fn recusa_coluna_do_group_by_ausente_ou_repetida() {
+        assert_eq!(tuple_slots(&[Aggregate], &[1]), None);
+        assert_eq!(tuple_slots(&[Column(1), Column(1), Aggregate], &[1]), None);
+        assert_eq!(tuple_slots(&[Column(3), Aggregate], &[1]), None);
     }
 }

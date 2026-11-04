@@ -103,7 +103,10 @@ pub unsafe fn form_array_from_datum(
                 },
             )
         }
-        PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID) => {
+        // SYBASE FORK: `IN (...)` on CHAR/VARCHAR columns (varlena like text).
+        PgOid::BuiltIn(PgBuiltInOids::TEXTARRAYOID)
+        | PgOid::BuiltIn(PgBuiltInOids::BPCHARARRAYOID)
+        | PgOid::BuiltIn(PgBuiltInOids::VARCHARARRAYOID) => {
             unsafe { Array::<String>::from_polymorphic_datum(datum, is_null, pg_sys::TEXTOID) }.map(
                 |arr| {
                     arr.iter()

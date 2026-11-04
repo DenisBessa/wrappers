@@ -1316,23 +1316,31 @@ pub(super) extern "C-unwind" fn get_foreign_plan<E: Into<ErrorReport>, W: Foreig
             // We keep this off the base-rel-scan code path so state.tgts (the
             // base-rel scan columns set in get_foreign_rel_size) is preserved
             // when the planner picks the base-rel path.
+            // `num` is the slot in the target list, not the position in the
+            // remote row, so `SELECT count(*), codi_emp ... GROUP BY codi_emp`
+            // lands each value in a slot of its own type.
+            let group_attnos: Vec<pg_sys::AttrNumber> = state
+                .group_by
+                .iter()
+                .map(|c| c.num as pg_sys::AttrNumber)
+                .collect();
+            let (group_slots, aggregate_slots) =
+                crate::upper::tuple_slots(&crate::upper::target_items(exprs), &group_attnos)
+                    .expect("target list validated in get_foreign_upper_paths");
             let mut new_tgts = Vec::new();
-            let mut col_num = 1usize;
-            for col in &state.group_by {
+            for (col, num) in state.group_by.iter().zip(group_slots) {
                 new_tgts.push(Column {
                     name: col.name.clone(),
-                    num: col_num,
+                    num,
                     type_oid: col.type_oid,
                 });
-                col_num += 1;
             }
-            for agg in &state.aggregates {
+            for (agg, num) in state.aggregates.iter().zip(aggregate_slots) {
                 new_tgts.push(Column {
                     name: agg.alias.clone(),
-                    num: col_num,
+                    num,
                     type_oid: agg.type_oid,
                 });
-                col_num += 1;
             }
             state.tgts = new_tgts;
 
