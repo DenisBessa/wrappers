@@ -1172,6 +1172,8 @@ pub(super) extern "C-unwind" fn get_foreign_paths<
             // parameterizations tie; the planner kept the first one, e.g.
             // efimpent by codi_emp only, bringing every tax of the company per
             // outer row. Make the one that pushes more join clauses cheaper.
+            // shortcut: counts ppi clauses even if the deparse cannot push them;
+            // check pushability here if such a ppi ever wins a tie it shouldn't.
             let clauses = if (*ppi).ppi_clauses.is_null() {
                 0
             } else {
