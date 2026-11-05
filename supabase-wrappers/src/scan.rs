@@ -72,6 +72,9 @@ pub(crate) struct FdwState<E: Into<ErrorReport>, W: ForeignDataWrapper<E>> {
     row: Row,
     // fingerprint of current parameter values to detect rescan changes
     param_fingerprint: String,
+    // SYBASE FORK (KOROK-224): outer-row params still to evaluate on the first
+    // iterate after BeginForeignScan (they have no value there).
+    params_pending: bool,
     _phantom: PhantomData<E>,
 }
 
@@ -97,6 +100,7 @@ impl<E: Into<ErrorReport>, W: ForeignDataWrapper<E>> FdwState<E, W> {
             nulls: Vec::new(),
             row: Row::new(),
             param_fingerprint: String::new(),
+            params_pending: false,
             _phantom: PhantomData,
         }
     }
@@ -703,6 +707,17 @@ impl FdwScanPrivate {
             };
 
             let param = Self::read_param(list, idx);
+            // SYBASE FORK (KOROK-224): an array param (`IN ($1, $2)`) keeps an
+            // array placeholder, never the scalar `'null'` string.
+            let value = match &param {
+                Some(p)
+                    if mode == QualValueMode::Placeholder
+                        && pg_sys::get_element_type(p.type_oid) != Oid::INVALID =>
+                {
+                    Value::Array(Vec::new())
+                }
+                _ => value,
+            };
 
             Some(Qual {
                 field,
@@ -812,6 +827,7 @@ impl<E: Into<ErrorReport>, W: ForeignDataWrapper<E>> FdwState<E, W> {
                 nulls: Vec::new(),
                 row: Row::new(),
                 param_fingerprint: String::new(),
+                params_pending: false,
                 _phantom: PhantomData,
             }
         }
@@ -848,6 +864,40 @@ pub(super) extern "C-unwind" fn get_foreign_rel_size<
 
             // extract limit
             state.limit = extract_limit(root, baserel, foreigntableid);
+            // SYBASE FORK BEGIN (KOROK-224): the remote stops at N rows only
+            // when its rows are already the query result. With a join, a
+            // local filter or an ORDER BY it could not take, TOP N cut before
+            // Postgres did (`ORDER BY … LIMIT 50` with a local filter: 25 rows).
+            if state.limit.is_some() {
+                let parse = (*root).parse;
+                let restrictions = pgrx::memcx::current_context(|mcx| {
+                    List::<*mut c_void>::downcast_ptr_in_memcx((*baserel).baserestrictinfo, mcx)
+                        .map(|l| {
+                            l.iter()
+                                .filter(|r| !(*(**r as *mut pg_sys::RestrictInfo)).pseudoconstant)
+                                .count()
+                        })
+                        .unwrap_or(0)
+                });
+                let pathkeys = if (*root).query_pathkeys.is_null() {
+                    0
+                } else {
+                    (*(*root).query_pathkeys).length as usize
+                };
+                let whole_result = pg_sys::bms_num_members((*root).all_baserels) == 1
+                    && state.quals.len() == restrictions
+                    && state.sorts.len() == pathkeys
+                    && (*parse).distinctClause.is_null()
+                    && (*parse).setOperations.is_null()
+                    && (*parse).havingQual.is_null()
+                    && !(*parse).hasWindowFuncs
+                    && !(*parse).hasTargetSRFs
+                    && (*parse).limitOption == pg_sys::LimitOption::LIMIT_OPTION_COUNT;
+                if !whole_result {
+                    state.limit = None;
+                }
+            }
+            // SYBASE FORK END
 
             // get foreign table options
             let ftable = pg_sys::GetForeignTable(foreigntableid);
@@ -1464,33 +1514,36 @@ unsafe fn assign_parameter_value<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>
                             if param.id > 0 && param.id <= params_cnt {
                                 let plist = (*plist_info).params.as_slice(params_cnt);
                                 let p: pg_sys::ParamExternData = plist[param.id - 1];
-                                if let Some(cell) =
-                                    Cell::from_polymorphic_datum(p.value, p.isnull, p.ptype)
-                                {
-                                    qual.value = Value::Cell(cell.clone());
-                                    current_value = Some(Value::Cell(cell));
+                                if let Some(value) = value_from_datum(p.value, p.isnull, p.ptype) {
+                                    qual.value = value.clone();
+                                    current_value = Some(value);
                                 }
                             }
                         }
                     }
+                    // SYBASE FORK (KOROK-224): the ExprState comes from
+                    // init_param_exprs (BeginForeignScan). Building it here, on
+                    // every row, compiled a new JIT function per row: 173 mil
+                    // functions and ~2 GB per backend in the 05/11 OOM.
                     ParamKind::PARAM_EXEC
-                        if !(at_begin && uses_exec_param(param.expr_eval.expr as _)) =>
+                        if !param.expr_eval.expr_state.is_null()
+                            && !(at_begin && uses_exec_param(param.expr_eval.expr as _)) =>
                     {
-                        // evaluate parameter value
-                        param.expr_eval.expr_state = pg_sys::ExecInitExpr(
-                            param.expr_eval.expr,
-                            node as *mut pg_sys::PlanState,
-                        );
                         let mut isnull = false;
-                        if let Some(datum) = polyfill::exec_eval_expr(
-                            param.expr_eval.expr_state,
-                            econtext,
-                            &mut isnull,
-                        ) && let Some(cell) =
-                            Cell::from_polymorphic_datum(datum, isnull, param.type_oid)
-                        {
-                            qual.value = Value::Cell(cell.clone());
-                            current_value = Some(Value::Cell(cell));
+                        // The value is copied into Rust right away; per-tuple
+                        // memory keeps rescans from piling up in the query context.
+                        let value = PgMemoryContexts::For((*econtext).ecxt_per_tuple_memory)
+                            .switch_to(|_| {
+                                polyfill::exec_eval_expr(
+                                    param.expr_eval.expr_state,
+                                    econtext,
+                                    &mut isnull,
+                                )
+                                .and_then(|datum| value_from_datum(datum, isnull, param.type_oid))
+                            });
+                        if let Some(value) = value {
+                            qual.value = value.clone();
+                            current_value = Some(value);
                         }
                     }
                     _ => {}
@@ -1501,6 +1554,26 @@ unsafe fn assign_parameter_value<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>
                     .lock()
                     .expect("param.eval_value should be locked");
                 *eval_value = current_value;
+            }
+        }
+    }
+}
+
+// SYBASE FORK (KOROK-224): build each PARAM_EXEC ExprState once, in the query
+// memory context of BeginForeignScan. Building does not evaluate, so outer-row
+// params (KOROK-213) are safe here.
+unsafe fn init_param_exprs<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(
+    node: *mut pg_sys::ForeignScanState,
+    state: &mut FdwState<E, W>,
+) {
+    unsafe {
+        for qual in state.quals.iter_mut() {
+            if let Some(param) = &mut qual.param
+                && param.kind == ParamKind::PARAM_EXEC
+                && !param.expr_eval.expr.is_null()
+            {
+                param.expr_eval.expr_state =
+                    pg_sys::ExecInitExpr(param.expr_eval.expr, node as *mut pg_sys::PlanState);
             }
         }
     }
@@ -1602,8 +1675,14 @@ pub(super) extern "C-unwind" fn begin_foreign_scan<
         // SYBASE FORK END
 
         // assign parameter values to qual
+        init_param_exprs(node, &mut state);
         assign_parameter_value(node, &mut state, true);
         state.param_fingerprint = compute_param_fingerprint(&state);
+        state.params_pending = state.quals.iter().any(|q| {
+            q.param.as_ref().is_some_and(|p| {
+                p.kind == ParamKind::PARAM_EXEC && uses_exec_param(p.expr_eval.expr as _)
+            })
+        });
 
         // begin scan if it is not EXPLAIN statement
         if eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as c_int <= 0 {
@@ -1648,8 +1727,12 @@ pub(super) extern "C-unwind" fn iterate_foreign_scan<
     unsafe {
         let mut state = PgBox::<FdwState<E, W>>::from_pg((*node).fdw_state as _);
 
-        // evaluate parameter values
-        assign_parameter_value(node, &mut state, false);
+        // SYBASE FORK (KOROK-224): the remote query reads the params once, on
+        // the first row; a new value always comes through re_scan.
+        if state.params_pending {
+            assign_parameter_value(node, &mut state, false);
+            state.params_pending = false;
+        }
 
         // clear slot
         let slot = (*node).ss.ss_ScanTupleSlot;
@@ -1727,6 +1810,7 @@ pub(super) extern "C-unwind" fn re_scan_foreign_scan<
         if !fdw_state.is_null() {
             let mut state = PgBox::<FdwState<E, W>>::from_pg(fdw_state);
             assign_parameter_value(node, &mut state, false);
+            state.params_pending = false;
             let next_fingerprint = compute_param_fingerprint(&state);
             let result = if next_fingerprint != state.param_fingerprint {
                 state.param_fingerprint = next_fingerprint;

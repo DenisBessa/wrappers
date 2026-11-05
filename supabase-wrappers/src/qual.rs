@@ -1,7 +1,7 @@
 use crate::prelude::*;
 use pgrx::pg_sys::Oid;
 use pgrx::{
-    FromDatum, PgBuiltInOids, PgOid,
+    AnyNumeric, FromDatum, PgBuiltInOids, PgOid,
     datum::{Array, Date, JsonB, Timestamp},
     is_a,
     list::List,
@@ -116,6 +116,16 @@ pub unsafe fn form_array_from_datum(
                 },
             )
         }
+        // SYBASE FORK: `IN (...)` on NUMERIC columns (valor, aliquota).
+        PgOid::BuiltIn(PgBuiltInOids::NUMERICARRAYOID) => unsafe {
+            Array::<AnyNumeric>::from_polymorphic_datum(datum, is_null, pg_sys::NUMERICOID)
+        }
+        .map(|arr| {
+            arr.iter()
+                .filter(|v| v.is_some())
+                .map(|v| Cell::Numeric(v.expect("non-null array element")))
+                .collect::<Vec<_>>()
+        }),
         PgOid::BuiltIn(PgBuiltInOids::DATEARRAYOID) => {
             unsafe { Array::<Date>::from_polymorphic_datum(datum, is_null, pg_sys::DATEOID) }.map(
                 |arr| {
@@ -148,6 +158,49 @@ pub unsafe fn form_array_from_datum(
         _ => None,
     }
 }
+
+// SYBASE FORK BEGIN: KOROK-224
+/// Converts an evaluated parameter into a qual value: arrays (`= ANY($1)`,
+/// `IN ($1, $2)`) become `Value::Array`, a NULL array an empty one.
+pub(crate) unsafe fn value_from_datum(
+    datum: Datum,
+    is_null: bool,
+    typoid: pg_sys::Oid,
+) -> Option<Value> {
+    unsafe {
+        if pg_sys::get_element_type(typoid) != Oid::INVALID {
+            if is_null {
+                return Some(Value::Array(Vec::new()));
+            }
+            return form_array_from_datum(datum, is_null, typoid).map(Value::Array);
+        }
+        Cell::from_polymorphic_datum(datum, is_null, typoid).map(Value::Cell)
+    }
+}
+
+/// Array types `form_array_from_datum` can read.
+fn is_supported_array_type(typoid: pg_sys::Oid) -> bool {
+    matches!(
+        PgOid::from(typoid),
+        PgOid::BuiltIn(
+            PgBuiltInOids::BOOLARRAYOID
+                | PgBuiltInOids::CHARARRAYOID
+                | PgBuiltInOids::INT2ARRAYOID
+                | PgBuiltInOids::FLOAT4ARRAYOID
+                | PgBuiltInOids::INT4ARRAYOID
+                | PgBuiltInOids::FLOAT8ARRAYOID
+                | PgBuiltInOids::INT8ARRAYOID
+                | PgBuiltInOids::TEXTARRAYOID
+                | PgBuiltInOids::BPCHARARRAYOID
+                | PgBuiltInOids::VARCHARARRAYOID
+                | PgBuiltInOids::NUMERICARRAYOID
+                | PgBuiltInOids::DATEARRAYOID
+                | PgBuiltInOids::TIMESTAMPARRAYOID
+                | PgBuiltInOids::JSONBARRAYOID
+        )
+    )
+}
+// SYBASE FORK END
 
 // SYBASE FORK BEGIN: KOROK-213
 #[pgrx::pg_guard]
@@ -407,6 +460,56 @@ pub(crate) unsafe fn extract_from_scalar_array_op_expr(
                     }
                 }
 
+                // SYBASE FORK BEGIN: KOROK-224. Array known only at execution:
+                // `IN ($1, $2)` and `= ANY($1)` in a generic plan, or
+                // `= ANY(array(subquery))` (InitPlan). Evaluated in the scan like
+                // the scalar Param in extract_from_op_expr.
+                if is_a(left, pg_sys::NodeTag::T_Var)
+                    && !pg_sys::contain_var_clause(right)
+                    && !pg_sys::contain_volatile_functions(right)
+                    && is_supported_array_type(pg_sys::exprType(right))
+                {
+                    let left = left as *mut pg_sys::Var;
+                    if pg_sys::bms_is_member((*left).varno as c_int, baserel_ids)
+                        && (*left).varattno >= 1
+                    {
+                        let field = pg_sys::get_attname(baserel_id, (*left).varattno, false);
+                        let type_oid = pg_sys::exprType(right);
+                        // A bare Param keeps kind/id (rebuilt in from_scan_private);
+                        // any other expression is shipped whole as PARAM_EXEC id 0.
+                        let (kind, id, param_expr) = if is_a(right, pg_sys::NodeTag::T_Param) {
+                            let p = right as *mut pg_sys::Param;
+                            let expr: *mut pg_sys::Expr =
+                                if (*p).paramkind == pg_sys::ParamKind::PARAM_EXEC {
+                                    right as _
+                                } else {
+                                    ptr::null_mut()
+                                };
+                            ((*p).paramkind, (*p).paramid as usize, expr)
+                        } else {
+                            (pg_sys::ParamKind::PARAM_EXEC, 0, right as _)
+                        };
+                        return Some(Qual {
+                            field: CStr::from_ptr(field).to_str().unwrap().to_string(),
+                            operator: pgrx::name_data_to_str(&(*opr).oprname).to_string(),
+                            value: Value::Array(Vec::new()),
+                            use_or: (*expr).useOr,
+                            param: Some(Param {
+                                kind,
+                                id,
+                                type_oid,
+                                eval_value: Mutex::new(None).into(),
+                                expr_eval: ExprEval {
+                                    expr: param_expr,
+                                    expr_state: ptr::null_mut(),
+                                },
+                            }),
+                            value_const: None,
+                        });
+                    }
+                }
+                // SYBASE FORK END
+
                 if let Some(stm) = pgrx::nodes::node_to_string(expr as _) {
                     report_warning(format!("only support const scalar array in qual: {stm}",));
                 }
@@ -529,6 +632,12 @@ pub(crate) unsafe fn extract_quals(
                 List::<*mut c_void>::downcast_ptr_in_memcx((*baserel).baserestrictinfo, mcx)
             {
                 for cond in conds.iter() {
+                    // SYBASE FORK (KOROK-224): a qual with no column of this
+                    // table (`$outer = 4`) gates the whole scan in a Result
+                    // node; there is nothing to push and nothing to warn about.
+                    if (*(*cond as *mut pg_sys::RestrictInfo)).pseudoconstant {
+                        continue;
+                    }
                     let expr = (*(*cond as *mut pg_sys::RestrictInfo)).clause as *mut pg_sys::Node;
                     let extracted = if is_a(expr, pg_sys::NodeTag::T_OpExpr) {
                         extract_from_op_expr(baserel_id, (*baserel).relids, expr as _)

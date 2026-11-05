@@ -82,9 +82,10 @@ mod deparse_qual_unit_tests {
         );
     }
 
-    // Defensive: in case the planner ever emits `<>` with useOr=true.
+    // `x <> ANY(...)` (useOr=true) is true when x differs from some element;
+    // NOT IN would drop rows Postgres keeps.
     #[test]
-    fn renders_not_in_for_integer_array_with_or() {
+    fn renders_or_chain_for_not_equal_any() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual(
             "status",
@@ -92,7 +93,21 @@ mod deparse_qual_unit_tests {
             Value::Array(vec![Cell::I32(1), Cell::I32(2)]),
             true,
         );
-        assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "status NOT IN (1, 2)");
+        assert_eq!(
+            deparse_qual_to_sybase(&q, &mut fmt),
+            "(status <> 1 OR status <> 2)"
+        );
+    }
+
+    // KOROK-224: a bound empty array (or one with only NULLs) must not render
+    // `IN ()`.
+    #[test]
+    fn renders_constant_for_empty_array() {
+        let mut fmt = SybaseCellFormatter {};
+        let any = qual("codi_emp", "=", Value::Array(vec![]), true);
+        assert_eq!(deparse_qual_to_sybase(&any, &mut fmt), "1 = 0");
+        let all = qual("codi_emp", "<>", Value::Array(vec![]), false);
+        assert_eq!(deparse_qual_to_sybase(&all, &mut fmt), "1 = 1");
     }
 
     // Non-`=`/`<>` array operators (e.g. `>`) — keep parenthesised OR list.

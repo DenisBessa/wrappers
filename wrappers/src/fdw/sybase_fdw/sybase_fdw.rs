@@ -350,6 +350,11 @@ pub(super) fn deparse_qual_to_sybase(qual: &Qual, fmt: &mut SybaseCellFormatter)
     }
 
     if let Value::Array(cells) = &qual.value {
+        // KOROK-224: an empty array (bound `= ANY('{}')`, or only NULLs) would
+        // render `IN ()`, a syntax error. ANY of nothing is false, ALL is true.
+        if cells.is_empty() {
+            return if qual.use_or { "1 = 0" } else { "1 = 1" }.to_string();
+        }
         let values: Vec<String> = cells.iter().map(|c| fmt.fmt_cell(c)).collect();
         // PG emits `IN (...)` as `=` with useOr=true (ANY) and `NOT IN (...)`
         // as `<>` with useOr=false (ALL). Both collapse to the canonical SQL
@@ -358,7 +363,8 @@ pub(super) fn deparse_qual_to_sybase(qual: &Qual, fmt: &mut SybaseCellFormatter)
         // Value::Array with useOr=false (interface.rs:589).
         return match (oper, qual.use_or) {
             ("=", true) => format!("{} IN ({})", qual.field, values.join(", ")),
-            ("<>", false) | ("<>", true) => {
+            // `<> ANY` (useOr) is "differs from some element", not NOT IN.
+            ("<>", false) => {
                 format!("{} NOT IN ({})", qual.field, values.join(", "))
             }
             (_, use_or) => {
@@ -841,21 +847,16 @@ impl SybaseFdw {
                 .join(", ")
         };
 
-        // Only push down LIMIT when there is also ORDER BY.
-        // This prevents issues with nested loop JOINs where PostgreSQL executes
-        // the foreign scan multiple times. Without ORDER BY, the LIMIT could
-        // cause incorrect results by returning only the first N rows on each
-        // iteration, missing rows that should match the JOIN conditions.
+        // The framework only hands a LIMIT over when this scan alone is the
+        // query result (single relation, every filter and sort pushed); see
+        // get_foreign_rel_size (KOROK-224). Requiring ORDER BY here was the
+        // old guard against joins, and it still let local filters cut rows.
         let mut sql = if let Some(limit) = limit {
-            if !sorts.is_empty() {
-                let real_limit = limit.offset + limit.count;
-                format!(
-                    "SELECT TOP {real_limit} {tgts} FROM {} AS _wrappers_tbl",
-                    self.table
-                )
-            } else {
-                format!("SELECT {tgts} FROM {} AS _wrappers_tbl", self.table)
-            }
+            let real_limit = limit.offset + limit.count;
+            format!(
+                "SELECT TOP {real_limit} {tgts} FROM {} AS _wrappers_tbl",
+                self.table
+            )
         } else {
             format!("SELECT {tgts} FROM {} AS _wrappers_tbl", self.table)
         };
