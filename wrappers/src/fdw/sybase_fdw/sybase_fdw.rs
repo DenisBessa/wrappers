@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 
 use supabase_wrappers::prelude::*;
@@ -316,6 +317,18 @@ impl CellFormatter for SybaseCellFormatter {
 /// the remote optimizer use an index scan. For non-`=` operators with an array
 /// (rare in practice) we still parenthesise the OR list.
 pub(super) fn deparse_qual_to_sybase(qual: &Qual, fmt: &mut SybaseCellFormatter) -> String {
+    // KOROK-261: a parameter evaluated to NULL left the `'null'` text
+    // placeholder (SQL Anywhere -157 on a numeric column), and a NULL array
+    // `<> ALL` rendered `1 = 1`. Every pushed-down comparison is strict, so a
+    // NULL operand matches nothing, also in the aggregate path (COUNT gives 0).
+    if qual
+        .param
+        .as_ref()
+        .is_some_and(|param| param.eval_null.load(Ordering::Relaxed))
+    {
+        return "1 = 0".to_string();
+    }
+
     let oper = qual.operator.as_str();
 
     if let Value::Cell(cell) = &qual.value

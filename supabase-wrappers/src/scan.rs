@@ -12,6 +12,7 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::mem;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 use pgrx::pg_sys::panic::ErrorReport;
 use std::os::raw::c_int;
@@ -749,6 +750,7 @@ impl FdwScanPrivate {
                     id,
                     type_oid,
                     eval_value: Mutex::new(None).into(),
+                    eval_null: Default::default(),
                     expr_eval: ExprEval {
                         expr,
                         expr_state: ptr::null_mut(),
@@ -1545,6 +1547,7 @@ unsafe fn assign_parameter_value<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>
         for qual in &mut state.quals.iter_mut() {
             if let Some(param) = &mut qual.param {
                 let mut current_value: Option<Value> = None;
+                let mut current_null = false;
                 match param.kind {
                     ParamKind::PARAM_EXTERN => {
                         // get parameter list in execution state
@@ -1554,6 +1557,7 @@ unsafe fn assign_parameter_value<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>
                             if param.id > 0 && param.id <= params_cnt {
                                 let plist = (*plist_info).params.as_slice(params_cnt);
                                 let p: pg_sys::ParamExternData = plist[param.id - 1];
+                                current_null = p.isnull;
                                 if let Some(value) = value_from_datum(p.value, p.isnull, p.ptype) {
                                     qual.value = value.clone();
                                     current_value = Some(value);
@@ -1579,6 +1583,7 @@ unsafe fn assign_parameter_value<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>
                             &mut isnull,
                         )
                         .and_then(|datum| value_from_datum(datum, isnull, param.type_oid));
+                        current_null = isnull;
                         if let Some(value) = value {
                             qual.value = value.clone();
                             current_value = Some(value);
@@ -1592,6 +1597,7 @@ unsafe fn assign_parameter_value<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>
                     .lock()
                     .expect("param.eval_value should be locked");
                 *eval_value = current_value;
+                param.eval_null.store(current_null, Ordering::Relaxed);
             }
         }
     }

@@ -316,6 +316,7 @@ pub(crate) unsafe fn extract_from_op_expr(
                                 id: (*right).paramid as _,
                                 type_oid: (*right).paramtype,
                                 eval_value: Mutex::new(None).into(),
+                                eval_null: Default::default(),
                                 expr_eval: ExprEval {
                                     expr: if (*right).paramkind == pg_sys::ParamKind::PARAM_EXEC {
                                         right as _
@@ -343,6 +344,7 @@ pub(crate) unsafe fn extract_from_op_expr(
                                 id: 0,
                                 type_oid,
                                 eval_value: Mutex::new(None).into(),
+                                eval_null: Default::default(),
                                 expr_eval: ExprEval {
                                     expr: right as _,
                                     expr_state: ptr::null_mut(),
@@ -499,6 +501,7 @@ pub(crate) unsafe fn extract_from_scalar_array_op_expr(
                                 id,
                                 type_oid,
                                 eval_value: Mutex::new(None).into(),
+                                eval_null: Default::default(),
                                 expr_eval: ExprEval {
                                     expr: param_expr,
                                     expr_state: ptr::null_mut(),
