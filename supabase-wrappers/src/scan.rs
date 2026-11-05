@@ -1443,6 +1443,9 @@ pub(super) extern "C-unwind" fn explain_foreign_scan<
 unsafe fn assign_parameter_value<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>(
     node: *mut pg_sys::ForeignScanState,
     state: &mut FdwState<E, W>,
+    // SYBASE FORK (KOROK-213): in BeginForeignScan the outer-row params are
+    // not set yet; evaluating them there crashes the backend.
+    at_begin: bool,
 ) {
     unsafe {
         let estate = (*node).ss.ps.state;
@@ -1470,7 +1473,9 @@ unsafe fn assign_parameter_value<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>
                             }
                         }
                     }
-                    ParamKind::PARAM_EXEC => {
+                    ParamKind::PARAM_EXEC
+                        if !(at_begin && uses_exec_param(param.expr_eval.expr as _)) =>
+                    {
                         // evaluate parameter value
                         param.expr_eval.expr_state = pg_sys::ExecInitExpr(
                             param.expr_eval.expr,
@@ -1597,7 +1602,7 @@ pub(super) extern "C-unwind" fn begin_foreign_scan<
         // SYBASE FORK END
 
         // assign parameter values to qual
-        assign_parameter_value(node, &mut state);
+        assign_parameter_value(node, &mut state, true);
         state.param_fingerprint = compute_param_fingerprint(&state);
 
         // begin scan if it is not EXPLAIN statement
@@ -1644,7 +1649,7 @@ pub(super) extern "C-unwind" fn iterate_foreign_scan<
         let mut state = PgBox::<FdwState<E, W>>::from_pg((*node).fdw_state as _);
 
         // evaluate parameter values
-        assign_parameter_value(node, &mut state);
+        assign_parameter_value(node, &mut state, false);
 
         // clear slot
         let slot = (*node).ss.ss_ScanTupleSlot;
@@ -1721,7 +1726,7 @@ pub(super) extern "C-unwind" fn re_scan_foreign_scan<
         let fdw_state = (*node).fdw_state as *mut FdwState<E, W>;
         if !fdw_state.is_null() {
             let mut state = PgBox::<FdwState<E, W>>::from_pg(fdw_state);
-            assign_parameter_value(node, &mut state);
+            assign_parameter_value(node, &mut state, false);
             let next_fingerprint = compute_param_fingerprint(&state);
             let result = if next_fingerprint != state.param_fingerprint {
                 state.param_fingerprint = next_fingerprint;

@@ -389,6 +389,18 @@ pub(super) extern "C-unwind" fn get_foreign_upper_paths<
             return;
         }
 
+        // SYBASE FORK BEGIN (KOROK-213): the aggregate SQL is built in
+        // BeginForeignScan, before outer-row params get a value.
+        if state.quals.iter().any(|q| {
+            q.param.as_ref().is_some_and(|p| {
+                !p.expr_eval.expr.is_null() && crate::qual::uses_exec_param(p.expr_eval.expr as _)
+            })
+        }) {
+            debug2!("WHERE depends on the outer row, skipping aggregate pushdown");
+            return;
+        }
+        // SYBASE FORK END
+
         // Extract aggregates from the query
         let aggregates = match extract_aggregates(root, output_rel, extra) {
             Some(aggs) => aggs,

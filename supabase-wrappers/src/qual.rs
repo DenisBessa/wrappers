@@ -149,6 +149,31 @@ pub unsafe fn form_array_from_datum(
     }
 }
 
+// SYBASE FORK BEGIN: KOROK-213
+#[pgrx::pg_guard]
+unsafe extern "C-unwind" fn exec_param_walker(node: *mut pg_sys::Node, ctx: *mut c_void) -> bool {
+    unsafe {
+        if node.is_null() {
+            return false;
+        }
+        if is_a(node, pg_sys::NodeTag::T_Param)
+            && (*(node as *mut pg_sys::Param)).paramkind == pg_sys::ParamKind::PARAM_EXEC
+        {
+            return true;
+        }
+        pg_sys::expression_tree_walker(node, Some(exec_param_walker), ctx)
+    }
+}
+
+/// True when `expr` reads a PARAM_EXEC Param: a value from the outer row
+/// (correlated subquery, LATERAL, parameterized NestLoop) or from an InitPlan.
+/// It is only set right before the node runs; in BeginForeignScan the slot is
+/// still zeroed and not null, so `substr(<param>, …)` dereferences NULL.
+pub(crate) unsafe fn uses_exec_param(expr: *mut pg_sys::Node) -> bool {
+    unsafe { exec_param_walker(expr, ptr::null_mut()) }
+}
+// SYBASE FORK END
+
 pub(crate) unsafe fn get_operator(opno: pg_sys::Oid) -> pg_sys::Form_pg_operator {
     unsafe {
         let htup = pg_sys::SearchSysCache1(
