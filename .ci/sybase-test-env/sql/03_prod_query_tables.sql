@@ -131,3 +131,31 @@ CREATE TABLE bethadba.grande (
     id     INTEGER NOT NULL PRIMARY KEY,
     texto  VARCHAR(200)
 );
+
+-- ============================================================================
+-- KOROK-224: forma da R-4020 (efentradas × effornece × efimpent, codi_emp nas
+-- três). Ver fixture 156.
+-- ============================================================================
+DROP TABLE IF EXISTS bethadba.ppi_ent;
+CREATE TABLE bethadba.ppi_ent (
+    codi_emp  INTEGER NOT NULL,
+    codi_ent  INTEGER NOT NULL,
+    codi_for  INTEGER NOT NULL,
+    dent_ent  DATE NOT NULL,
+    PRIMARY KEY (codi_emp, codi_ent)
+);
+DROP TABLE IF EXISTS bethadba.ppi_for;
+CREATE TABLE bethadba.ppi_for (
+    codi_emp  INTEGER NOT NULL,
+    codi_for  INTEGER NOT NULL,
+    tins_for  INTEGER,
+    PRIMARY KEY (codi_emp, codi_for)
+);
+DROP TABLE IF EXISTS bethadba.ppi_imp;
+CREATE TABLE bethadba.ppi_imp (
+    codi_emp  INTEGER NOT NULL,
+    codi_ent  INTEGER NOT NULL,
+    codi_imp  INTEGER NOT NULL,
+    vlor_ien  NUMERIC(15,2),
+    PRIMARY KEY (codi_emp, codi_ent, codi_imp)
+);

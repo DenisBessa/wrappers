@@ -1168,7 +1168,16 @@ pub(super) extern "C-unwind" fn get_foreign_paths<
         for ppi in seen_ppis {
             let param_rows = (*ppi).ppi_rows;
             let param_startup = startup_cost + fdw_startup_cost;
-            let param_total = param_startup + param_rows;
+            // KOROK-224: with no stats every ppi_rows clamps to 1 and the
+            // parameterizations tie; the planner kept the first one, e.g.
+            // efimpent by codi_emp only, bringing every tax of the company per
+            // outer row. Make the one that pushes more join clauses cheaper.
+            let clauses = if (*ppi).ppi_clauses.is_null() {
+                0
+            } else {
+                (*(*ppi).ppi_clauses).length
+            };
+            let param_total = param_startup + param_rows + 0.5_f64.powi(clauses);
 
             let param_path = pg_sys::create_foreignscan_path(
                 root,

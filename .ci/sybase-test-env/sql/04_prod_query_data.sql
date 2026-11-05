@@ -171,4 +171,9 @@ COMMIT;
 -- grande — 1 milhão de linhas de ~150 bytes.
 INSERT INTO bethadba.grande SELECT row_num, repeat('x', 150) FROM sa_rowgenerator(1, 1000000);
 
+-- ppi_* (KOROK-224) — 2 empresas: 1000 fornecedores, 3000 entradas, impostos em 300.
+INSERT INTO bethadba.ppi_for SELECT e.v, r.row_num, 1 FROM sa_rowgenerator(1, 1000) r, (SELECT 1 v UNION ALL SELECT 2) e;
+INSERT INTO bethadba.ppi_ent SELECT e.v, r.row_num, mod(r.row_num, 1000) + 1, DATEADD(day, mod(r.row_num, 300), '2026-01-01') FROM sa_rowgenerator(1, 3000) r, (SELECT 1 v UNION ALL SELECT 2) e;
+INSERT INTO bethadba.ppi_imp SELECT e.v, r.row_num * 10, i.v, 1 FROM sa_rowgenerator(1, 300) r, (SELECT 1 v UNION ALL SELECT 2) e, (SELECT 16 v UNION ALL SELECT 25) i;
+
 COMMIT;

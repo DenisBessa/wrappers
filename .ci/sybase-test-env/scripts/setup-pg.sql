@@ -116,6 +116,21 @@ CREATE FOREIGN TABLE dominio.grande (
 ) SERVER sybase_test_server
   OPTIONS (table 'bethadba.grande');
 
+-- KOROK-224: forma da R-4020. `rows` com a ordem de grandeza de produção, para
+-- o planner montar o mesmo plano (fixture 156).
+DROP FOREIGN TABLE IF EXISTS dominio.ppi_ent, dominio.ppi_for, dominio.ppi_imp CASCADE;
+CREATE FOREIGN TABLE dominio.ppi_ent (
+    codi_emp integer NOT NULL, codi_ent integer NOT NULL,
+    codi_for integer NOT NULL, dent_ent date NOT NULL
+) SERVER sybase_test_server OPTIONS (table 'bethadba.ppi_ent', rows '937000');
+CREATE FOREIGN TABLE dominio.ppi_for (
+    codi_emp integer NOT NULL, codi_for integer NOT NULL, tins_for integer
+) SERVER sybase_test_server OPTIONS (table 'bethadba.ppi_for', rows '290000');
+CREATE FOREIGN TABLE dominio.ppi_imp (
+    codi_emp integer NOT NULL, codi_ent integer NOT NULL,
+    codi_imp integer NOT NULL, vlor_ien numeric(15,2)
+) SERVER sybase_test_server OPTIONS (table 'bethadba.ppi_imp', rows '1310000');
+
 -- ============================================================================
 -- Módulo de Folha (Payroll). Espelha a topologia em que os ex-pg_tests
 -- consumiam tabelas Sybase reais — agora sustentado pelo schema em
