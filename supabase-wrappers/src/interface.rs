@@ -17,6 +17,7 @@ use std::fmt;
 use std::iter::Zip;
 use std::mem;
 use std::slice::Iter;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 // fdw system catalog oids
@@ -510,6 +511,10 @@ pub struct Param {
 
     /// parameter value which is evaluated during query execution
     pub eval_value: Arc<Mutex<Option<Value>>>,
+
+    /// SYBASE FORK (KOROK-261): the last evaluated value was SQL NULL. Every
+    /// pushed-down comparison is strict, so the scan can return no rows.
+    pub eval_null: Arc<AtomicBool>,
 
     // internal variables for expression evaluation
     pub(super) expr_eval: ExprEval,
