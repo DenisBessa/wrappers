@@ -3,7 +3,9 @@
 -- ORDER BY codi_sai LIMIT 50` devolvia 25 linhas (o Sybase cortava antes do
 -- filtro). Sem ORDER BY o LIMIT não era empurrado (ctvlancto LIMIT 1001: 23 s).
 -- Agora o LIMIT só desce quando a FT sozinha é o resultado: uma relação, todos
--- os filtros e toda a ordenação empurrados.
+-- os filtros e toda a ordenação empurrados, nenhum filtro ou ordenação em texto
+-- (o Domínio compara sem distinguir maiúsculas) e ordenação só por coluna NOT
+-- NULL (no SQL Anywhere o NULL vem primeiro).
 -- @expect: ok
 
 BEGIN;
@@ -66,7 +68,25 @@ SELECT array_agg(codi_sai ORDER BY codi_sai) AS obtido FROM (
    ORDER BY codi_sai DESC LIMIT 7 OFFSET 3) x \gset
 SELECT pg_temp.confere(:'esperado' = :'obtido', 'ORDER BY + LIMIT + OFFSET');
 
--- 5. Join com tabela local + ORDER BY + LIMIT: a FT não pode parar em N
+-- 5. Texto: o Sybase compara sem distinguir maiúsculas ('CLIENTE 3' casa
+-- 'Cliente 3'); com TOP 3 ele devolvia 3, 6 e 9 e o filtro local deixava 1.
+SELECT count(*) AS n FROM (SELECT codi_sai FROM dominio.efsaidas_slow
+  WHERE codi_emp = 51800
+    AND cliente_sai IN ('CLIENTE 3', 'Cliente 6', 'CLIENTE 9', 'Cliente 12', 'CLIENTE 15', 'Cliente 18')
+  LIMIT 3) x \gset
+SELECT pg_temp.confere(:n = 3, format('filtro de texto + LIMIT 3 devolveu %s', :n));
+
+-- 6. Ordenação: só coluna NOT NULL e não texto (no SQL Anywhere o NULL vem primeiro)
+SELECT pg_temp.confere(
+    pg_temp.plano('SELECT codi_sai FROM dominio.efsaidas_slow WHERE codi_emp = 51800 ORDER BY data_sai LIMIT 5')
+      LIKE '%limit = None%',
+    'LIMIT empurrado com ORDER BY de coluna anulável');
+SELECT pg_temp.confere(
+    pg_temp.plano('SELECT codi_sai FROM dominio.efsaidas_slow WHERE codi_emp = 51800 ORDER BY codi_sai LIMIT 5')
+      LIKE '%limit = Some(Limit { count: 5, offset: 0 })%',
+    'LIMIT não empurrado com ORDER BY de coluna NOT NULL');
+
+-- 7. Join com tabela local + ORDER BY + LIMIT: a FT não pode parar em N
 CREATE TEMP TABLE pares AS SELECT g AS codi_sai FROM generate_series(0, 100000, 2) g;
 ANALYZE pares;
 SELECT count(*) AS n FROM (SELECT s.codi_sai FROM dominio.efsaidas_slow s

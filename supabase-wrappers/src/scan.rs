@@ -868,7 +868,35 @@ pub(super) extern "C-unwind" fn get_foreign_rel_size<
             // when its rows are already the query result. With a join, a
             // local filter or an ORDER BY it could not take, TOP N cut before
             // Postgres did (`ORDER BY … LIMIT 50` with a local filter: 25 rows).
+            // Text is out too: the Domínio compares case-insensitively
+            // ('a' = 'A'), so a pushed text filter returns extra rows that the
+            // local recheck drops, and text sorts by another collation. A
+            // nullable sort is out because SQL Anywhere puts NULL first.
             if state.limit.is_some() {
+                let is_text = |attnum: pg_sys::AttrNumber| {
+                    let typ = pg_sys::get_atttype(foreigntableid, attnum);
+                    typ == pg_sys::TEXTOID
+                        || typ == pg_sys::VARCHAROID
+                        || typ == pg_sys::BPCHAROID
+                        || typ == pg_sys::NAMEOID
+                        || typ == pg_sys::CHAROID
+                };
+                let attnum = |field: &str| {
+                    let name = std::ffi::CString::new(field).unwrap_or_default();
+                    pg_sys::get_attnum(foreigntableid, name.as_ptr())
+                };
+                #[cfg(any(feature = "pg17", feature = "pg18"))]
+                let not_null = |attnum: usize| {
+                    pg_sys::bms_is_member(attnum as c_int, (*baserel).notnullattnums)
+                };
+                // shortcut: before PG 17 there is no notnullattnums; no sorted TOP there.
+                #[cfg(not(any(feature = "pg17", feature = "pg18")))]
+                let not_null = |_: usize| false;
+                let exact = state.quals.iter().all(|q| !is_text(attnum(&q.field)))
+                    && state
+                        .sorts
+                        .iter()
+                        .all(|s| !is_text(s.field_no as _) && not_null(s.field_no));
                 let parse = (*root).parse;
                 let restrictions = pgrx::memcx::current_context(|mcx| {
                     List::<*mut c_void>::downcast_ptr_in_memcx((*baserel).baserestrictinfo, mcx)
@@ -884,7 +912,8 @@ pub(super) extern "C-unwind" fn get_foreign_rel_size<
                 } else {
                     (*(*root).query_pathkeys).length as usize
                 };
-                let whole_result = pg_sys::bms_num_members((*root).all_baserels) == 1
+                let whole_result = exact
+                    && pg_sys::bms_num_members((*root).all_baserels) == 1
                     && state.quals.len() == restrictions
                     && state.sorts.len() == pathkeys
                     && (*parse).distinctClause.is_null()
@@ -1530,17 +1559,15 @@ unsafe fn assign_parameter_value<E: Into<ErrorReport>, W: ForeignDataWrapper<E>>
                             && !(at_begin && uses_exec_param(param.expr_eval.expr as _)) =>
                     {
                         let mut isnull = false;
-                        // The value is copied into Rust right away; per-tuple
-                        // memory keeps rescans from piling up in the query context.
-                        let value = PgMemoryContexts::For((*econtext).ecxt_per_tuple_memory)
-                            .switch_to(|_| {
-                                polyfill::exec_eval_expr(
-                                    param.expr_eval.expr_state,
-                                    econtext,
-                                    &mut isnull,
-                                )
-                                .and_then(|datum| value_from_datum(datum, isnull, param.type_oid))
-                            });
+                        // Not in per-tuple memory: the value is read on a later
+                        // iterate, after ResetExprContext, and Cell::Bytea keeps
+                        // the Postgres pointer.
+                        let value = polyfill::exec_eval_expr(
+                            param.expr_eval.expr_state,
+                            econtext,
+                            &mut isnull,
+                        )
+                        .and_then(|datum| value_from_datum(datum, isnull, param.type_oid));
                         if let Some(value) = value {
                             qual.value = value.clone();
                             current_value = Some(value);

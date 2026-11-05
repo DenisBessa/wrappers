@@ -94,7 +94,28 @@ SELECT count(*) AS r_count FROM (SELECT codi_sai FROM dominio.efsaidas_slow
   WHERE codi_emp = ANY(array(SELECT codi_emp FROM alvo)) OFFSET 0) s \gset
 SELECT pg_temp.confere(:r_count = :e_um, '= ANY(array(subconsulta)) com total diferente');
 
--- 6. JIT: um NestLoop parametrizado com muitas linhas por reescaneamento
+-- 6. numeric: IN ($1, $2, $3) e LATERAL com expressão sobre a coluna externa,
+-- avaliada no rescan e lida no iterate seguinte.
+SELECT count(*) AS e_num FROM dominio.efsaidas_slow WHERE valor_sai IN (101.00, 102.00, 250.00) \gset
+SELECT pg_temp.confere(:e_num = 3, 'base sem os valores 101, 102 e 250');
+PREPARE p_num(numeric, numeric, numeric) AS SELECT count(*) FROM (
+    SELECT codi_sai FROM dominio.efsaidas_slow WHERE valor_sai IN ($1, $2, $3) OFFSET 0) s;
+SELECT pg_temp.confere(
+    pg_temp.plano('EXECUTE p_num(101.00, 102.00, 250.00)') LIKE '%value: Array([Numeric(%',
+    'numeric IN ($1, $2, $3) não empurrado');
+EXECUTE p_num(101.00, 102.00, 250.00) \gset r_
+EXECUTE p_num(101.00, 102.00, 250.00) \gset r_
+EXECUTE p_num(101.00, 102.00, 250.00) \gset r_
+SELECT pg_temp.confere(:r_count = :e_num, 'numeric IN ($1, $2, $3) no 3º EXECUTE');
+CREATE TEMP TABLE valores AS SELECT 100.004 + g AS v FROM generate_series(1, 30) g;
+ANALYZE valores;
+SELECT count(*) AS e_lat FROM valores x
+  JOIN (SELECT valor_sai FROM dominio.efsaidas_slow OFFSET 0) s ON s.valor_sai = round(x.v, 2) \gset
+SELECT count(*) AS r_lat FROM valores x CROSS JOIN LATERAL (
+    SELECT codi_sai FROM dominio.efsaidas_slow s WHERE s.valor_sai = round(x.v, 2)) l \gset
+SELECT pg_temp.confere(:e_lat = 30 AND :r_lat = :e_lat, format('LATERAL numeric: %s de %s', :r_lat, :e_lat));
+
+-- 7. JIT: um NestLoop parametrizado com muitas linhas por reescaneamento
 -- compilava uma função por linha (176 para 166 linhas, 385cbaf).
 SET LOCAL jit = on;
 SET LOCAL jit_above_cost = 0;
