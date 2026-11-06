@@ -1,9 +1,22 @@
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
-mod deparse_qual_unit_tests {
-    use super::super::sybase_fdw::{SybaseCellFormatter, deparse_qual_to_sybase};
+mod tests {
+    // O runner do pgrx chama "tests".<fn>(): o módulo #[pg_schema] precisa se chamar `tests`.
+    use super::super::sybase_fdw::{
+        SybaseCellFormatter, deparse_agg_sybase, deparse_agg_with_alias_sybase,
+        deparse_aggregate_sybase, deparse_qual_to_sybase,
+    };
+    use pgrx::pg_sys;
     use pgrx::pg_test;
-    use supabase_wrappers::prelude::{Cell, Qual, Value};
+    use supabase_wrappers::prelude::{Aggregate, AggregateKind, Cell, Column, Qual, Value};
+
+    fn col(name: &str, num: usize, type_oid: pg_sys::Oid) -> Column {
+        Column {
+            name: name.to_string(),
+            num,
+            type_oid,
+        }
+    }
 
     fn qual(field: &str, operator: &str, value: Value, use_or: bool) -> Qual {
         Qual::new(field, operator, value, use_or)
@@ -181,23 +194,6 @@ mod deparse_qual_unit_tests {
             "UPPER(cname) NOT LIKE UPPER('%tmp%')"
         );
     }
-}
-
-#[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
-mod deparse_aggregate_unit_tests {
-    use super::super::sybase_fdw::{deparse_agg_sybase, deparse_agg_with_alias_sybase};
-    use pgrx::pg_sys;
-    use pgrx::pg_test;
-    use supabase_wrappers::prelude::{Aggregate, AggregateKind, Column};
-
-    fn col(name: &str, num: usize, type_oid: pg_sys::Oid) -> Column {
-        Column {
-            name: name.to_string(),
-            num,
-            type_oid,
-        }
-    }
 
     #[pg_test]
     fn renders_count_star() {
@@ -261,27 +257,6 @@ mod deparse_aggregate_unit_tests {
             };
             assert_eq!(deparse_agg_sybase(&agg), sql);
         }
-    }
-}
-
-#[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
-mod deparse_aggregate_query_tests {
-    use super::super::sybase_fdw::deparse_aggregate_sybase;
-    use pgrx::pg_sys;
-    use pgrx::pg_test;
-    use supabase_wrappers::prelude::{Aggregate, AggregateKind, Cell, Column, Qual, Value};
-
-    fn col(name: &str, num: usize, type_oid: pg_sys::Oid) -> Column {
-        Column {
-            name: name.to_string(),
-            num,
-            type_oid,
-        }
-    }
-
-    fn qual(field: &str, operator: &str, value: Value, use_or: bool) -> Qual {
-        Qual::new(field, operator, value, use_or)
     }
 
     #[pg_test]
