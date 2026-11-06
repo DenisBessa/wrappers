@@ -1,6 +1,8 @@
-#[cfg(test)]
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
 mod deparse_qual_unit_tests {
     use super::super::sybase_fdw::{SybaseCellFormatter, deparse_qual_to_sybase};
+    use pgrx::pg_test;
     use supabase_wrappers::prelude::{Cell, Qual, Value};
 
     fn qual(field: &str, operator: &str, value: Value, use_or: bool) -> Qual {
@@ -8,7 +10,7 @@ mod deparse_qual_unit_tests {
     }
 
     // IN (...) — the bug fix
-    #[test]
+    #[pg_test]
     fn renders_in_for_integer_array() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual(
@@ -23,14 +25,14 @@ mod deparse_qual_unit_tests {
         );
     }
 
-    #[test]
+    #[pg_test]
     fn renders_in_for_single_value_array() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual("id", "=", Value::Array(vec![Cell::I64(42)]), true);
         assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "id IN (42)");
     }
 
-    #[test]
+    #[pg_test]
     fn renders_in_for_string_array() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual(
@@ -49,7 +51,7 @@ mod deparse_qual_unit_tests {
     // Without this branch the framework's deparse_with_fmt panics
     // (`Value::Array(_) => unreachable!()`), surfaced in prod as
     // XX000 "internal error: entered unreachable code".
-    #[test]
+    #[pg_test]
     fn renders_not_in_for_integer_array_no_or() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual(
@@ -64,7 +66,7 @@ mod deparse_qual_unit_tests {
         );
     }
 
-    #[test]
+    #[pg_test]
     fn renders_not_in_for_string_array_no_or() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual(
@@ -84,7 +86,7 @@ mod deparse_qual_unit_tests {
 
     // `x <> ANY(...)` (useOr=true) is true when x differs from some element;
     // NOT IN would drop rows Postgres keeps.
-    #[test]
+    #[pg_test]
     fn renders_or_chain_for_not_equal_any() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual(
@@ -101,7 +103,7 @@ mod deparse_qual_unit_tests {
 
     // KOROK-224: a bound empty array (or one with only NULLs) must not render
     // `IN ()`.
-    #[test]
+    #[pg_test]
     fn renders_constant_for_empty_array() {
         let mut fmt = SybaseCellFormatter {};
         let any = qual("codi_emp", "=", Value::Array(vec![]), true);
@@ -111,7 +113,7 @@ mod deparse_qual_unit_tests {
     }
 
     // Non-`=`/`<>` array operators (e.g. `>`) — keep parenthesised OR list.
-    #[test]
+    #[pg_test]
     fn renders_parenthesised_or_for_other_operators() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual(
@@ -124,21 +126,21 @@ mod deparse_qual_unit_tests {
     }
 
     // Scalar fall-through: delegates to framework deparse, no precedence risk.
-    #[test]
+    #[pg_test]
     fn renders_scalar_equality() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual("codi_emp", "=", Value::Cell(Cell::I32(51800)), false);
         assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "codi_emp = 51800");
     }
 
-    #[test]
+    #[pg_test]
     fn renders_boolean_is_null_replacement() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual("active", "is", Value::Cell(Cell::Bool(true)), false);
         assert_eq!(deparse_qual_to_sybase(&q, &mut fmt), "active = 1");
     }
 
-    #[test]
+    #[pg_test]
     fn renders_boolean_is_not() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual("active", "is not", Value::Cell(Cell::Bool(false)), false);
@@ -150,7 +152,7 @@ mod deparse_qual_unit_tests {
     // rejects it ("Syntax error near '~'"), failing any query that pushes an
     // ILIKE on a foreign column. Translate to a collation-independent
     // UPPER()/UPPER() case-insensitive match.
-    #[test]
+    #[pg_test]
     fn renders_ilike_as_upper_like() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual(
@@ -165,7 +167,7 @@ mod deparse_qual_unit_tests {
         );
     }
 
-    #[test]
+    #[pg_test]
     fn renders_not_ilike_as_upper_not_like() {
         let mut fmt = SybaseCellFormatter {};
         let q = qual(
@@ -181,10 +183,12 @@ mod deparse_qual_unit_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
 mod deparse_aggregate_unit_tests {
     use super::super::sybase_fdw::{deparse_agg_sybase, deparse_agg_with_alias_sybase};
     use pgrx::pg_sys;
+    use pgrx::pg_test;
     use supabase_wrappers::prelude::{Aggregate, AggregateKind, Column};
 
     fn col(name: &str, num: usize, type_oid: pg_sys::Oid) -> Column {
@@ -195,7 +199,7 @@ mod deparse_aggregate_unit_tests {
         }
     }
 
-    #[test]
+    #[pg_test]
     fn renders_count_star() {
         let agg = Aggregate {
             kind: AggregateKind::Count,
@@ -208,7 +212,7 @@ mod deparse_aggregate_unit_tests {
         assert_eq!(deparse_agg_with_alias_sybase(&agg), "COUNT(*) AS cnt");
     }
 
-    #[test]
+    #[pg_test]
     fn renders_sum_with_alias() {
         // Mirrors the prod CTE that OOM-killed Postgres before aggregate
         // pushdown landed: `SUM(vpag_entp) AS valor_pago`. Without the
@@ -229,7 +233,7 @@ mod deparse_aggregate_unit_tests {
         );
     }
 
-    #[test]
+    #[pg_test]
     fn renders_count_column_with_distinct() {
         let agg = Aggregate {
             kind: AggregateKind::CountColumn,
@@ -241,7 +245,7 @@ mod deparse_aggregate_unit_tests {
         assert_eq!(deparse_agg_sybase(&agg), "COUNT(DISTINCT codi_emp)");
     }
 
-    #[test]
+    #[pg_test]
     fn renders_min_max_avg() {
         for (kind, sql) in [
             (AggregateKind::Min, "MIN(valor)"),
@@ -260,10 +264,12 @@ mod deparse_aggregate_unit_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
 mod deparse_aggregate_query_tests {
     use super::super::sybase_fdw::deparse_aggregate_sybase;
     use pgrx::pg_sys;
+    use pgrx::pg_test;
     use supabase_wrappers::prelude::{Aggregate, AggregateKind, Cell, Column, Qual, Value};
 
     fn col(name: &str, num: usize, type_oid: pg_sys::Oid) -> Column {
@@ -278,7 +284,7 @@ mod deparse_aggregate_query_tests {
         Qual::new(field, operator, value, use_or)
     }
 
-    #[test]
+    #[pg_test]
     fn count_star_no_quals_no_group() {
         let aggs = vec![Aggregate {
             kind: AggregateKind::Count,
@@ -303,7 +309,7 @@ mod deparse_aggregate_query_tests {
     // can aggregate locally — that's the OOM. The expected SQL below proves
     // we send a single grouped query and only the GROUP BY cardinality
     // (orders of magnitude smaller) crosses the wire.
-    #[test]
+    #[pg_test]
     fn prod_oom_query_pushes_sum_and_group_by() {
         let group_by = vec![
             col("codi_emp", 1, pg_sys::INT4OID),
@@ -339,7 +345,7 @@ mod deparse_aggregate_query_tests {
     }
 
     // Sanity: GROUP BY alone (no WHERE) still emits a valid query.
-    #[test]
+    #[pg_test]
     fn group_by_without_quals() {
         let group_by = vec![col("codi_emp", 1, pg_sys::INT4OID)];
         let aggs = vec![Aggregate {
