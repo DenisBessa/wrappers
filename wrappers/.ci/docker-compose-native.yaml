@@ -97,7 +97,7 @@ services:
       retries: 3
 
   s3:
-    image: minio/minio
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z # minio/minio saiu do Docker Hub
     container_name: s3
     environment:
       - MINIO_ROOT_USER=admin

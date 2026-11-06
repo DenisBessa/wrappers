@@ -1270,43 +1270,38 @@ pub(super) extern "C-unwind" fn get_foreign_plan<E: Into<ErrorReport>, W: Foreig
                                         (*opexpr).args,
                                         mcx,
                                     )
+                                    && args.len() == 2
                                 {
-                                    if args.len() == 2 {
-                                        let left = unnest_clause(*args.get(0).unwrap() as _);
-                                        let right = unnest_clause(*args.get(1).unwrap() as _);
+                                    let left = unnest_clause(*args.get(0).unwrap() as _);
+                                    let right = unnest_clause(*args.get(1).unwrap() as _);
 
-                                        let has_our_var =
-                                            (pgrx::is_a(left, pg_sys::NodeTag::T_Var)
-                                                && pg_sys::bms_is_member(
-                                                    (*(left as *mut pg_sys::Var)).varno as c_int,
-                                                    (*baserel).relids,
-                                                ))
-                                                || (pgrx::is_a(right, pg_sys::NodeTag::T_Var)
-                                                    && pg_sys::bms_is_member(
-                                                        (*(right as *mut pg_sys::Var)).varno
-                                                            as c_int,
-                                                        (*baserel).relids,
-                                                    ));
+                                    let has_our_var = (pgrx::is_a(left, pg_sys::NodeTag::T_Var)
+                                        && pg_sys::bms_is_member(
+                                            (*(left as *mut pg_sys::Var)).varno as c_int,
+                                            (*baserel).relids,
+                                        ))
+                                        || (pgrx::is_a(right, pg_sys::NodeTag::T_Var)
+                                            && pg_sys::bms_is_member(
+                                                (*(right as *mut pg_sys::Var)).varno as c_int,
+                                                (*baserel).relids,
+                                            ));
 
-                                        let has_outer_var =
-                                            (pgrx::is_a(left, pg_sys::NodeTag::T_Var)
-                                                && !pg_sys::bms_is_member(
-                                                    (*(left as *mut pg_sys::Var)).varno as c_int,
-                                                    (*baserel).relids,
-                                                ))
-                                                || (pgrx::is_a(right, pg_sys::NodeTag::T_Var)
-                                                    && !pg_sys::bms_is_member(
-                                                        (*(right as *mut pg_sys::Var)).varno
-                                                            as c_int,
-                                                        (*baserel).relids,
-                                                    ));
+                                    let has_outer_var = (pgrx::is_a(left, pg_sys::NodeTag::T_Var)
+                                        && !pg_sys::bms_is_member(
+                                            (*(left as *mut pg_sys::Var)).varno as c_int,
+                                            (*baserel).relids,
+                                        ))
+                                        || (pgrx::is_a(right, pg_sys::NodeTag::T_Var)
+                                            && !pg_sys::bms_is_member(
+                                                (*(right as *mut pg_sys::Var)).varno as c_int,
+                                                (*baserel).relids,
+                                            ));
 
-                                        if has_our_var && has_outer_var {
-                                            fdw_expr_list = pg_sys::lappend(
-                                                fdw_expr_list,
-                                                opexpr as *mut std::ffi::c_void,
-                                            );
-                                        }
+                                    if has_our_var && has_outer_var {
+                                        fdw_expr_list = pg_sys::lappend(
+                                            fdw_expr_list,
+                                            opexpr as *mut std::ffi::c_void,
+                                        );
                                     }
                                 }
                                 continue;
